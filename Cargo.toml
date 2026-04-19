@@ -1,0 +1,24 @@
+[package]
+name = "relay"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "A self-hosted chat platform POC in async Rust"
+
+[dependencies]
+axum = { version = "0.8.8", features = ["ws"] }
+axum-extra = { version = "0.12.6", features = ["typed-header"] }
+futures-util = "0.3.32"
+governor = "0.10.4"
+reqwest = "0.13.2"
+serde = "1.0.228"
+serde_json = "1.0.149"
+sqlx = "0.8.6"
+tokio = { version = "1.51.0", features = ["full"] }
+tokio-tungstenite = "0.29.0"
+tokio-util = "0.7.18"
+tower-http = { version = "0.6.8", features = ["fs", "trace"] }
+tower_governor = "0.8.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tungstenite = "0.29.0"
