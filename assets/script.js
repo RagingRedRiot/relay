@@ -1,15 +1,24 @@
+const username = "user";
+const password = "pass";
+
 const socket = new WebSocket('ws://localhost:3000/ws');
 
 socket.onopen = () => {
-    console.log("Connected")
+    socket.send(JSON.stringify({
+        Auth: {
+            username: "user",
+            password: "pass"
+        }
+    }));
 }
 
 socket.onmessage = (event) => {
     data = JSON.parse(event.data);
-    console.log('Received action ', data.action)
-    console.log('Received content ', data.content)
-
-    socket.send(JSON.stringify(data))
+    if (data == "AuthOk") {
+        console.log("Connected")
+    } else {
+        console.log(data)
+    }
 }
 
 socket.onclose = () => {

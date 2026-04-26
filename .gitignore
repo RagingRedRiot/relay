@@ -24,3 +24,6 @@ target
 # Added by cargo
 
 /target
+
+# Personal notes, not for commit
+NOTES.txt

@@ -1,17 +1,29 @@
-mod server;
+mod app;
+mod auth;
 mod handler;
+mod model;
+mod server;
+
 use std::net::SocketAddr;
 use tokio_util::sync::CancellationToken;
 
-use crate::handler::{app, RateLimitConfig};
+use crate::app::app;
+use crate::handler::RateLimitConfig;
 
 #[tokio::main]
 async fn main() {
     // initialize tracing
     tracing_subscriber::fmt::init();
-    
+
     let shutdown = CancellationToken::new();
-    let app = app(shutdown.clone(), RateLimitConfig { per_second: 4, burst: 10 }).await;
+    let app = app(
+        shutdown.clone(),
+        RateLimitConfig {
+            per_second: 4,
+            burst: 10,
+        },
+    )
+    .await;
 
     tokio::spawn({
         let shutdown = shutdown.clone();
@@ -22,15 +34,17 @@ async fn main() {
     });
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    
+
     axum::serve(
-        listener, 
+        listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
-    ).with_graceful_shutdown({
+    )
+    .with_graceful_shutdown({
         let shutdown = shutdown;
         async move { shutdown.cancelled().await }
-    }).await.unwrap();
-
+    })
+    .await
+    .unwrap();
 }
 
 async fn shutdown_signal() {
@@ -39,14 +53,14 @@ async fn shutdown_signal() {
             .await
             .expect("failed to install Ctrl+C handler");
     };
-                
+
     #[cfg(unix)]
     let terminate = async {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")                         
+            .expect("failed to install SIGTERM handler")
             .recv()
             .await;
-    };          
+    };
 
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
@@ -59,35 +73,49 @@ async fn shutdown_signal() {
 
 #[tokio::test]
 async fn test_shutdown() {
-    use tokio::task::JoinSet;
     use futures_util::StreamExt;
     use std::time::Duration;
+    use tokio::task::JoinSet;
 
     // Build App - Run in Task
     let shutdown = CancellationToken::new();
-    let app = app(shutdown.clone(), RateLimitConfig { per_second: 10, burst: 15 }).await;
+    let app = app(
+        shutdown.clone(),
+        RateLimitConfig {
+            per_second: 10,
+            burst: 15,
+        },
+    )
+    .await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let _ = tokio::spawn({
         let shutdown = shutdown.clone();
-        async move { let _ = axum::serve(
-        listener, 
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    ).with_graceful_shutdown({
-        let shutdown = shutdown.clone();
-        async move { shutdown.cancelled().await }
-    }).await;}});
+        async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown({
+                let shutdown = shutdown.clone();
+                async move { shutdown.cancelled().await }
+            })
+            .await;
+        }
+    });
 
     let mut clients = JoinSet::new();
 
     for _ in 1..100 {
         let url = format!("ws://{addr}/ws");
         clients.spawn(async move {
-          let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-          // Hold the connection open; exit when the server closes it.
-          while let Some(msg) = ws.next().await {
-              if msg.is_err() { break; }
-          }  
+            let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+            // Hold the connection open; exit when the server closes it.
+            while let Some(msg) = ws.next().await {
+                if msg.is_err() {
+                    break;
+                }
+            }
         });
     }
 
@@ -95,33 +123,62 @@ async fn test_shutdown() {
 
     tokio::time::timeout(Duration::from_secs(5), async {
         while clients.join_next().await.is_some() {}
-    }).await.expect("clients did not shut down in time");
+    })
+    .await
+    .expect("clients did not shut down in time");
 }
 
 #[tokio::test]
 async fn test_websocket_communications() {
+    use crate::model::{ClientCommand, ServerEvent};
     use futures_util::{SinkExt, StreamExt};
-    use crate::server::{ACTION, ClientCommand, ServerEvent};
 
     // Build App - Run in Task
     let shutdown = CancellationToken::new();
-    let app = app(shutdown.clone(), RateLimitConfig { per_second: 10, burst: 15 }).await;
+    let app = app(
+        shutdown.clone(),
+        RateLimitConfig {
+            per_second: 10,
+            burst: 15,
+        },
+    )
+    .await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    
+
     let _ = tokio::spawn({
         let shutdown = shutdown.clone();
-        async move { let _ = axum::serve(
-        listener, 
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    ).with_graceful_shutdown({
-        let shutdown = shutdown.clone();
-        async move { shutdown.cancelled().await }
-    }).await;}});
+        async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown({
+                let shutdown = shutdown.clone();
+                async move { shutdown.cancelled().await }
+            })
+            .await;
+        }
+    });
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(
-        format!("ws://{addr}/ws")
-    ).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientCommand::Auth {
+            username: "alice".to_owned(),
+            password: "alicepass".to_owned(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    let msg = ws.next().await.unwrap().unwrap();
+    let event = serde_json::from_str::<ServerEvent>(&msg.to_text().unwrap()).unwrap();
+    assert_eq!(event, ServerEvent::AuthOk);
 
     let binding = "a".repeat(10_000);
     let test_messages: Vec<&str> = vec![
@@ -139,40 +196,67 @@ async fn test_websocket_communications() {
     ];
 
     for m in test_messages {
-
-        ws.send(
-            tokio_tungstenite::tungstenite::Message::Text(
-                serde_json::to_string(
-                    &ServerEvent { action: ACTION::ECHO, content: m.to_owned() }
-                ).unwrap().into()
-            )
-        ).await.unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientCommand::Echo {
+                string: m.to_owned(),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
 
         let msg = ws.next().await.unwrap().unwrap();
-        let cmd = serde_json::from_str::<ClientCommand>(&msg.to_text().unwrap()).unwrap();
-        assert_eq!(cmd, ClientCommand { action: ACTION::ECHO, content: m.to_owned() });
+        let event = serde_json::from_str::<ServerEvent>(&msg.to_text().unwrap()).unwrap();
+        assert_eq!(
+            event,
+            ServerEvent::Echo {
+                string: m.to_owned()
+            }
+        );
     }
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        r#"{"action":"INVALID","content":"test"}"#.into()
-    )).await.unwrap();
+        r#"{"BogusVariant":{}}"#.into(),
+    ))
+    .await
+    .unwrap();
     let msg = ws.next().await.unwrap().unwrap();
-    let cmd = serde_json::from_str::<ClientCommand>(&msg.to_text().unwrap()).unwrap();
-    assert_eq!(cmd, ClientCommand { action: ACTION::ERROR, content: "invalid command".to_owned() });
+    let event = serde_json::from_str::<ServerEvent>(&msg.to_text().unwrap()).unwrap();
+    assert_eq!(
+        event,
+        ServerEvent::Error {
+            error: "invalid command".to_owned()
+        }
+    );
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        r#"{"action":"ECHO".; "content":"malformed JSON'\"}"#.into()
-    )).await.unwrap();
+        r#"{"Echo":{"string":}}"#.into(),
+    ))
+    .await
+    .unwrap();
     let msg = ws.next().await.unwrap().unwrap();
-    let cmd = serde_json::from_str::<ClientCommand>(&msg.to_text().unwrap()).unwrap();
-    assert_eq!(cmd, ClientCommand { action: ACTION::ERROR, content: "malformed JSON".to_owned() });
+    let event = serde_json::from_str::<ServerEvent>(&msg.to_text().unwrap()).unwrap();
+    assert_eq!(
+        event,
+        ServerEvent::Error {
+            error: "malformed JSON".to_owned()
+        }
+    );
 
-     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        "just a string".into()
-    )).await.unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        "just a string".into(),
+    ))
+    .await
+    .unwrap();
     let msg = ws.next().await.unwrap().unwrap();
-    let cmd = serde_json::from_str::<ClientCommand>(&msg.to_text().unwrap()).unwrap();
-    assert_eq!(cmd, ClientCommand { action: ACTION::ERROR, content: "malformed JSON".to_owned() });
+    let event = serde_json::from_str::<ServerEvent>(&msg.to_text().unwrap()).unwrap();
+    assert_eq!(
+        event,
+        ServerEvent::Error {
+            error: "malformed JSON".to_owned()
+        }
+    );
 
     shutdown.cancel();
 }
@@ -180,7 +264,14 @@ async fn test_websocket_communications() {
 #[tokio::test]
 async fn test_rate_limit_rejects_over_burst() {
     let shutdown = CancellationToken::new();
-    let app = app(shutdown.clone(), RateLimitConfig { burst: 5, per_second: 1 }).await;
+    let app = app(
+        shutdown.clone(),
+        RateLimitConfig {
+            burst: 5,
+            per_second: 1,
+        },
+    )
+    .await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -188,7 +279,8 @@ async fn test_rate_limit_rejects_over_burst() {
         let _ = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
-        ).await;
+        )
+        .await;
     });
 
     let client = reqwest::Client::new();
@@ -200,10 +292,14 @@ async fn test_rate_limit_rejects_over_burst() {
         statuses.push(resp.status().as_u16());
     }
 
-    assert_eq!(statuses[0], 200, "first request blocked — limiter misconfigured");
+    assert_eq!(
+        statuses[0], 200,
+        "first request blocked — limiter misconfigured"
+    );
     assert!(
         statuses.iter().any(|&s| s == 429),
-        "expected at least one 429, got {:?}", statuses
+        "expected at least one 429, got {:?}",
+        statuses
     );
 
     shutdown.cancel();
@@ -211,37 +307,62 @@ async fn test_rate_limit_rejects_over_burst() {
 
 #[tokio::test]
 async fn test_websocket_limiter() {
+    use crate::model::{ClientCommand, ServerEvent};
     use futures_util::{SinkExt, StreamExt};
-    use tungstenite::Message;
     use tokio::time::Duration;
-    use crate::server::{ACTION, ServerEvent};
+    use tungstenite::Message;
 
     // Build App - Run in Task
     let shutdown = CancellationToken::new();
-    let app = app(shutdown.clone(), RateLimitConfig { per_second: 10, burst: 15 }).await;
+    let app = app(
+        shutdown.clone(),
+        RateLimitConfig {
+            per_second: 10,
+            burst: 15,
+        },
+    )
+    .await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    
+
     let _ = tokio::spawn({
         let shutdown = shutdown.clone();
-        async move { let _ = axum::serve(
-        listener, 
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    ).with_graceful_shutdown({
-        let shutdown = shutdown.clone();
-        async move { shutdown.cancelled().await }
-    }).await;}});
+        async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown({
+                let shutdown = shutdown.clone();
+                async move { shutdown.cancelled().await }
+            })
+            .await;
+        }
+    });
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(
-        format!("ws://{addr}/ws")
-    ).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .unwrap();
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::to_string(&ClientCommand::Auth {
+            username: "alice".to_owned(),
+            password: "alicepass".to_owned(),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .unwrap();
 
     // Spam Flood
     for _ in 1..50 {
         let msg = tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::to_string(
-                &ServerEvent { action: ACTION::ECHO, content: "SPAM".to_owned() }
-            ).unwrap().into()
+            serde_json::to_string(&ClientCommand::Echo {
+                string: "SPAM".to_owned(),
+            })
+            .unwrap()
+            .into(),
         );
         if ws.send(msg).await.is_err() {
             break;
@@ -257,39 +378,46 @@ async fn test_websocket_limiter() {
                 Err(_) => break,
             }
         }
-    }).await;
+    })
+    .await;
 
     // Parse JSON Responses
-    let parsed: Vec<ServerEvent> = received.iter()
+    let parsed: Vec<ServerEvent> = received
+        .iter()
         .filter_map(|m| m.to_text().ok())
         .filter_map(|s| serde_json::from_str::<ServerEvent>(s).ok())
         .collect();
 
     // Count RateLimit responses
-    let rate_limit_count = parsed.iter()
-        .filter(|c| c.action == ACTION::RATELIMIT)
+    let rate_limit_count = parsed
+        .iter()
+        .filter(|c| matches!(c, ServerEvent::RateLimit { .. }))
         .count();
 
     // Count Echos
-    let echo_count = parsed.iter()
-        .filter(|c| c.action == ACTION::ECHO)
+    let echo_count = parsed
+        .iter()
+        .filter(|c| matches!(c, ServerEvent::Echo { .. }))
         .count();
 
-    let close_frame = received.iter().any(
-        |m| matches!(m, Message::Close(_)
-    ));
+    let close_frame = received.iter().any(|m| matches!(m, Message::Close(_)));
 
     assert_eq!(
         rate_limit_count, 3,
-        "expected excatly 3 RATELIMIT warnings, got {}: {:?}", rate_limit_count, parsed
+        "expected excatly 3 RATELIMIT warnings, got {}: {:?}",
+        rate_limit_count, parsed
     );
 
     assert!(
-        echo_count >= 15, 
-        "expected at least 15 echos before limited, got {}", echo_count
+        echo_count >= 15,
+        "expected at least 15 echos before limited, got {}",
+        echo_count
     );
 
-    assert!(close_frame, "expected server to send close after violating rate limits");
+    assert!(
+        close_frame,
+        "expected server to send close after violating rate limits"
+    );
 
     shutdown.cancel();
 }
