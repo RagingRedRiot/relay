@@ -9,7 +9,8 @@ use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
 use crate::{
     auth::AuthHandle,
-    handler::{RateLimitConfig, index, no_content, ok, script, ws_handler},
+    config::Config,
+    handler::{index, no_content, ok, script, ws_handler},
 };
 
 #[derive(Clone)]
@@ -18,18 +19,22 @@ pub struct AppState {
     pub(crate) auth_handle: AuthHandle,
 }
 
-pub(crate) async fn app(token: CancellationToken, rl: RateLimitConfig) -> axum::Router {
+pub async fn app(
+    token: CancellationToken,
+    auth_handle: AuthHandle,
+    config: Config,
+) -> axum::Router {
     let governor_conf = Arc::new(
         GovernorConfigBuilder::default()
-            .per_second(rl.per_second)
-            .burst_size(rl.burst)
+            .per_second(config.rate_limit_per_second)
+            .burst_size(config.rate_limit_burst)
             .finish()
             .unwrap(),
     );
 
     let state = AppState {
         shutdown: token.clone(),
-        auth_handle: crate::auth::spawn(token.clone()),
+        auth_handle,
     };
 
     Router::new()

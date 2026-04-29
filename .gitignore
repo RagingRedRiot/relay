@@ -20,10 +20,13 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-
 # Added by cargo
-
 /target
+
+.env
 
 # Personal notes, not for commit
 NOTES.txt
+
+# Local dev infrastructure, not for commit
+docker-compose.yml

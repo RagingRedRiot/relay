@@ -1,6 +1,3 @@
-#[cfg(test)]
-use std::collections::HashMap;
-
 use tokio::{
     select,
     sync::{mpsc, oneshot},
@@ -46,38 +43,16 @@ impl AuthHandle {
     }
 }
 
-#[cfg(test)]
-pub struct TestUser {
-    pub username: String,
-    pub password: String,
-    pub user_id: u64,
-}
-
-#[cfg(test)]
-pub fn alice() -> TestUser {
-    TestUser {
-        username: "alice".to_owned(),
-        password: "alicepass".to_owned(),
-        user_id: 1,
+fn authenticate(username: String, password: String) -> AuthResult {
+    // TODO
+    if username == "user" && password == "pass" {
+        return AuthResult::Ok { user_id: 1 };
+    } else {
+        return AuthResult::Failed;
     }
 }
 
-#[cfg(test)]
-pub fn bob() -> TestUser {
-    TestUser {
-        username: "bob".to_owned(),
-        password: "bobpass".to_owned(),
-        user_id: 2,
-    }
-}
-
-#[cfg(test)]
-pub fn default_test_users() -> Vec<TestUser> {
-    vec![alice(), bob()]
-}
-
-#[cfg(test)]
-pub fn spawn_test(shutdown: CancellationToken, users: Vec<TestUser>) -> AuthHandle {
+pub fn spawn(shutdown: CancellationToken) -> AuthHandle {
     // AUTH ACTOR COMMUNICATION CHANNELS
     // rx stays in the spawned actor
     // tx gets returned in AuthHandle
@@ -85,22 +60,13 @@ pub fn spawn_test(shutdown: CancellationToken, users: Vec<TestUser>) -> AuthHand
     // communication channel to the actor
     let (tx, mut rx) = mpsc::channel::<AuthRequest>(100);
 
-    let lookup: HashMap<String, (String, u64)> = users
-        .into_iter()
-        .map(|u| (u.username, (u.password, u.user_id)))
-        .collect();
-
     // AUTH ACTOR
     tokio::spawn(async move {
         loop {
             select! {
                 req = rx.recv() => {
                     let Some(req) = req else { continue };
-                    let result = match lookup.get(&req.username) {
-                        Some((pw, id)) if pw == &req.password => AuthResult::Ok {
-                            user_id: *id },
-                        _ => AuthResult::Failed,
-                    };
+                    let result = authenticate(req.username, req.password);
                     let _ = req.tx.send(result);
                 }
                 _ = shutdown.cancelled() => {
@@ -114,21 +80,51 @@ pub fn spawn_test(shutdown: CancellationToken, users: Vec<TestUser>) -> AuthHand
     AuthHandle { sender: tx }
 }
 
-pub fn spawn(shutdown: CancellationToken) -> AuthHandle {
-    #[cfg(test)]
-    {
-        return spawn_test(shutdown, default_test_users());
+pub mod testing {
+    use std::collections::HashMap;
+    use tokio::{select, sync::mpsc};
+    use tokio_util::sync::CancellationToken;
+
+    use crate::auth::{AuthHandle, AuthRequest, AuthResult};
+
+    pub struct TestUser {
+        pub username: String,
+        pub password: String,
+        pub user_id: u64,
     }
 
-    #[cfg(not(test))]
-    {
+    pub fn alice() -> TestUser {
+        TestUser {
+            username: "alice".to_owned(),
+            password: "alicepass".to_owned(),
+            user_id: 1,
+        }
+    }
+
+    pub fn bob() -> TestUser {
+        TestUser {
+            username: "bob".to_owned(),
+            password: "bobpass".to_owned(),
+            user_id: 2,
+        }
+    }
+
+    pub fn default_test_users() -> Vec<TestUser> {
+        vec![alice(), bob()]
+    }
+
+    pub fn spawn_test(shutdown: CancellationToken, users: Vec<TestUser>) -> AuthHandle {
         // AUTH ACTOR COMMUNICATION CHANNELS
         // rx stays in the spawned actor
         // tx gets returned in AuthHandle
         // Cloning auth handle allows a new
         // communication channel to the actor
-
         let (tx, mut rx) = mpsc::channel::<AuthRequest>(100);
+
+        let lookup: HashMap<String, (String, u64)> = users
+            .into_iter()
+            .map(|u| (u.username, (u.password, u.user_id)))
+            .collect();
 
         // AUTH ACTOR
         tokio::spawn(async move {
@@ -136,7 +132,11 @@ pub fn spawn(shutdown: CancellationToken) -> AuthHandle {
                 select! {
                     req = rx.recv() => {
                         let Some(req) = req else { continue };
-                        let result = authenticate(req.username, req.password);
+                        let result = match lookup.get(&req.username) {
+                            Some((pw, id)) if pw == &req.password => AuthResult::Ok {
+                                user_id: *id },
+                            _ => AuthResult::Failed,
+                        };
                         let _ = req.tx.send(result);
                     }
                     _ = shutdown.cancelled() => {
@@ -148,15 +148,5 @@ pub fn spawn(shutdown: CancellationToken) -> AuthHandle {
 
         // AUTH ACTOR HANDLE
         AuthHandle { sender: tx }
-    }
-}
-
-#[cfg(not(test))]
-fn authenticate(username: String, password: String) -> AuthResult {
-    // TODO
-    if username == "user" && password == "pass" {
-        return AuthResult::Ok { user_id: 1 };
-    } else {
-        return AuthResult::Failed;
     }
 }

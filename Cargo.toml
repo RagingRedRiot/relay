@@ -5,10 +5,27 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 description = "A self-hosted chat platform POC in async Rust"
 
+[features]
+testing = []
+
+[[test]]
+name = "websocket"
+required-features = ["testing"]
+
+[[test]]
+name = "rate_limit"
+required-features = ["testing"]
+
+[[test]]
+name = "shutdown"
+required-features = ["testing"]
+
 [dependencies]
 axum = { version = "0.8.8", features = ["ws"] }
 axum-extra = { version = "0.12.6", features = ["typed-header"] }
 chrono = "0.4.44"
+dotenvy = "0.15.7"
+envy = "0.4.2"
 futures-util = "0.3.32"
 governor = "0.10.4"
 reqwest = "0.13.2"

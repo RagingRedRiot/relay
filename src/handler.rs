@@ -11,11 +11,6 @@ use axum_extra::{
     headers::{self},
 };
 
-pub(crate) struct RateLimitConfig {
-    pub(crate) per_second: u64,
-    pub(crate) burst: u32,
-}
-
 pub(crate) async fn ws_handler(
     State(state): State<AppState>,
     ws: WebSocketUpgrade,
