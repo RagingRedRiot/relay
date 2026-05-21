@@ -1,4 +1,8 @@
 use std::net::SocketAddr;
+use relay::auth;
+use relay::model::{NewCredential, Password};
+use relay::user::ensure_admin;
+use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
 use relay::app::app;
@@ -13,9 +17,27 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let shutdown = CancellationToken::new();
-    let auth_handle = relay::auth::spawn(shutdown.clone());
+    
+    let pool = PgPool::connect(&config.database_url).await.unwrap();
+    sqlx::migrate!("./migrations")
+      .run(&pool)
+      .await
+      .expect("database migrations failed");
 
-    let app = app(shutdown.clone(), auth_handle, config).await;
+    ensure_admin(
+        pool.clone(),
+        &config.admin_username,
+        NewCredential{
+            password: Password(config.admin_credential.to_owned())
+        }
+    )
+      .await
+      .expect("failed to ensure default admin");
+
+    let auth_handle = auth::spawn(shutdown.clone(), pool.clone()).await;
+    let listener = tokio::net::TcpListener::bind(&config.bind).await.unwrap();
+    
+    let app = app(shutdown.clone(), auth_handle, config, pool.clone()).await;
 
     tokio::spawn({
         let shutdown = shutdown.clone();
@@ -24,8 +46,6 @@ async fn main() {
             shutdown.cancel();
         }
     });
-
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
 
     axum::serve(
         listener,

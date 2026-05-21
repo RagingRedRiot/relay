@@ -5,22 +5,8 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 description = "A self-hosted chat platform POC in async Rust"
 
-[features]
-testing = []
-
-[[test]]
-name = "websocket"
-required-features = ["testing"]
-
-[[test]]
-name = "rate_limit"
-required-features = ["testing"]
-
-[[test]]
-name = "shutdown"
-required-features = ["testing"]
-
 [dependencies]
+argon2 = { version = "0.5.3", features = ["std"] }
 axum = { version = "0.8.8", features = ["ws"] }
 axum-extra = { version = "0.12.6", features = ["typed-header"] }
 chrono = "0.4.44"
@@ -31,7 +17,7 @@ governor = "0.10.4"
 reqwest = "0.13.2"
 serde = "1.0.228"
 serde_json = "1.0.149"
-sqlx = "0.8.6"
+sqlx = {version = "0.8.6", features = ["runtime-tokio-native-tls", "postgres", "macros", "migrate", "uuid", "chrono", "json"] }
 tokio = { version = "1.51.0", features = ["full"] }
 tokio-tungstenite = "0.29.0"
 tokio-util = "0.7.18"

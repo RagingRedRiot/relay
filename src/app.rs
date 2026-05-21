@@ -6,23 +6,28 @@ use axum::{
 };
 use tokio_util::sync::CancellationToken;
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
+use sqlx::PgPool;
 
 use crate::{
     auth::AuthHandle,
     config::Config,
-    handler::{index, no_content, ok, script, ws_handler},
+    handler::{index, no_content, ok, script, ws_handler}, user::{self, UserHandle},
 };
 
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) shutdown: CancellationToken,
+    pub(crate) config: Arc<Config>,
     pub(crate) auth_handle: AuthHandle,
+    pub(crate) user_handle: UserHandle,
+    pub(crate) pool: PgPool,
 }
 
 pub async fn app(
-    token: CancellationToken,
+    shutdown: CancellationToken,
     auth_handle: AuthHandle,
     config: Config,
+    pool: PgPool,
 ) -> axum::Router {
     let governor_conf = Arc::new(
         GovernorConfigBuilder::default()
@@ -32,9 +37,16 @@ pub async fn app(
             .unwrap(),
     );
 
+    // ACTOR SPAWN AND HANDLE
+    // AuthHandle was spawned in calling function
+    let user_handle = user::spawn(shutdown.clone(), pool.clone()).await;
+
     let state = AppState {
-        shutdown: token.clone(),
+        shutdown: shutdown.clone(),
+        config: Arc::new(config),
         auth_handle,
+        user_handle,
+        pool,
     };
 
     Router::new()

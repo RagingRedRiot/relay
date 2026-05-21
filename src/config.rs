@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub database_url: String,
     #[serde(default = "default_bind")]
@@ -9,6 +9,10 @@ pub struct Config {
     pub rate_limit_per_second: u64,
     #[serde(default = "default_burst")]
     pub rate_limit_burst: u32,
+    #[serde(default)]
+    pub open_signups: bool,
+    pub admin_username: String,
+    pub admin_credential: String,
 }
 
 fn default_bind() -> String {

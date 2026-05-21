@@ -7,7 +7,7 @@ use uuid::Uuid;
 pub enum ClientCommand {
     Auth {
         username: String,
-        password: String,
+        password: Password,
     },
     Echo {
         string: String,
@@ -20,6 +20,13 @@ pub enum ClientCommand {
         room_id: Uuid,
         value: String,
     },
+    NewUser{
+        username: String,
+        password: Password,
+        first_name: Option<String>,
+        last_name: Option<String>,
+        alias: Option<String>,
+    },
     Close,
     Error {
         error: String,
@@ -29,6 +36,7 @@ pub enum ClientCommand {
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub enum ServerEvent {
     AuthOk,
+    NoAuth,
     Echo {
         string: String,
     },
@@ -43,6 +51,8 @@ pub enum ServerEvent {
     Close {
         reason: String,
     },
+    UserCreated,
+    NoUserCreated,
     Error {
         error: String,
     },
@@ -71,19 +81,27 @@ json_display!(ClientCommand);
 
 pub struct NewUser {
     pub username: String,
-    pub first_name: String,
-    pub last_name: String,
-    pub alias: String,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub alias: Option<String>,
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(sqlx::FromRow, Debug)]
 pub struct User {
-    pub first_name: String,
-    pub last_name: String,
-    pub alias: String,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub alias: Option<String>,
     pub username: String,
     user_id: Uuid,
     created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+pub struct Admin {
+    pub user_id: Uuid,
+    pub granted_by: Option<Uuid>,
+    pub granted_at: DateTime<Utc>,
+    is_default: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -102,14 +120,24 @@ impl std::fmt::Debug for PasswordHash {
     }
 }
 
+#[derive(sqlx::Type)]
+#[sqlx(transparent)]
+#[derive(serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct Password(pub String);
+
+impl std::fmt::Debug for Password {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Password(***)")
+    }
+}
+
 pub struct NewCredential {
-    username: String,
-    password_hash: PasswordHash,
+    pub password: Password,
 }
 
 #[derive(sqlx::FromRow)]
 pub struct Credential {
-    username: String,
+    user_id: Uuid,
     password_hash: PasswordHash,
     password_last_set: DateTime<Utc>,
 }

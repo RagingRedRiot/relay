@@ -9,11 +9,17 @@ use std::{net::SocketAddr, num::NonZeroU32, ops::ControlFlow};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::model::{NewCredential, NewUser};
+use crate::user::{UserHandle, UserResponse};
 use crate::{
     app::AppState,
     auth::{AuthHandle, AuthResult},
-    model::{ClientCommand, ServerEvent},
+    model::{ClientCommand, ServerEvent, Password},
 };
+
+struct Handles {
+    user_handle: UserHandle,
+}
 
 async fn send_close(sender: &mut SplitSink<WebSocket, Message>, who: SocketAddr) {
     // TODO tracing
@@ -68,92 +74,86 @@ async fn spawn_receiver_task(
     mut receiver: SplitStream<WebSocket>,
     shutdown: CancellationToken,
     mut user_tx: tokio::sync::mpsc::Sender<ServerEvent>,
-    auth_handle: AuthHandle,
+    auth_handle: AuthHandle, // AuthHandle is purposely separate from handles
+    handles: Handles,
+    open_signups: bool,
     who: SocketAddr,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // TODO - Add a timer so a non-authenticated socket cannot remain open indefinitely
 
-        let mut auth_result: Option<AuthResult> = None;
+        let (user_id, server_event) = prelude(&mut receiver, &auth_handle, &handles.user_handle, open_signups).await;
+
+        match server_event{
+            ServerEvent::AuthOk => {
+                let _ = user_tx.send(ServerEvent::AuthOk).await;
+            }
+            // Anything but AuthOk results in shutdown
+            ServerEvent::NoAuth => {
+                let _ = user_tx.send(ServerEvent::NoAuth).await;
+                let _ = user_tx.send(
+                    ServerEvent::Close { reason: "auth failed".to_owned() }
+                ).await;
+                return
+            }
+            ServerEvent::UserCreated => {
+                let _ = user_tx.send(ServerEvent::UserCreated).await;
+                let _ = user_tx.send(
+                    ServerEvent::Close { reason: "user created".to_owned() }
+                ).await;
+                return
+            }
+            ServerEvent::NoUserCreated => {
+                let _ = user_tx.send(ServerEvent::NoUserCreated).await;
+                let _ = user_tx.send(
+                    ServerEvent::Close { reason: "user creation failed".to_owned() }
+                ).await;
+                return
+            }
+            _ => {
+                let _ = user_tx.send(
+                    ServerEvent::Close { reason: "invalid command".to_owned() }
+                ).await;
+                return
+            }
+        };
 
         let limiter = RateLimiter::direct(
             Quota::per_second(NonZeroU32::new(10).unwrap())
                 .allow_burst(NonZeroU32::new(20).unwrap()),
         );
 
-        let mut limiter_trigger = 0;
+        let mut limiter_count = 0;
 
         loop {
             tokio::select! {
                 maybe_msg = receiver.next() => {
-                    if auth_result.is_none() {
-                        match maybe_msg {
-                            Some(Ok(Message::Text(t))) => {
-                                match serde_json::from_str::<ClientCommand>(&t) {
-                                    Ok(ClientCommand::Auth { username, password }) => {
-                                        match auth_handle.authenticate(username, password).await {
-                                            AuthResult::Ok { user_id } => {
-                                                auth_result = Some(AuthResult::Ok { user_id });
-                                                let _ = user_tx.send(ServerEvent::AuthOk).await;
-                                            }
-                                            AuthResult::Failed => {
-                                                let _ = user_tx.send(
-                                                    ServerEvent::Close { reason: "auth failed".to_owned() }
-                                                ).await;
-                                            }
-                                        }
+                    match maybe_msg {
+                        Some(Ok(msg)) => {
+                            match limiter.check() {
+                                Ok(()) => {
+                                    if process_message(msg, &mut user_tx, &handles, open_signups, user_id, who).await.is_break() {
+                                        shutdown.cancel();
+                                        break;
                                     }
-                                    Ok(_) => {
+                                }
+                                Err(_) => {
+                                    limiter_count = limiter_count + 1;
+
+                                    if limiter_count > 3 {
                                         let _ = user_tx.send(
-                                            ServerEvent::Close { reason: "auth expected".to_owned() }
+                                            ServerEvent::Close { reason: "rate limit exceeded three times".to_owned() }
                                         ).await;
-                                    }
-                                    Err(e) => {
-                                        println!("ERR {}", e);
+                                    } else {
                                         let _ = user_tx.send(
-                                            ServerEvent::Close { reason: "error occurred".to_owned() }
+                                            ServerEvent::RateLimit { error: "rate limit exceeded".to_owned() }
                                         ).await;
                                     }
                                 }
-                            }
-                            Some(Ok(_)) => {
-                                let _ = user_tx.send(
-                                    ServerEvent::Close { reason: "auth expected".to_owned() }
-                                ).await;
-                            }
-                            Some(Err(_)) | None => {
-                                // TODO
                             }
                         }
-                    } else {
-                        match maybe_msg {
-                            Some(Ok(msg)) => {
-                                match limiter.check() {
-                                    Ok(()) => {
-                                        if process_message(msg, &mut user_tx, who).await.is_break() {
-                                            shutdown.cancel();
-                                            break;
-                                        }
-                                    }
-                                    Err(_) => {
-                                        limiter_trigger = limiter_trigger + 1;
-
-                                        if limiter_trigger > 3 {
-                                            let _ = user_tx.send(
-                                                ServerEvent::Close { reason: "rate limit exceeded three times".to_owned() }
-                                            ).await;
-                                        } else {
-                                            let _ = user_tx.send(
-                                                ServerEvent::RateLimit { error: "rate limit exceeded".to_owned() }
-                                            ).await;
-                                        }
-                                    }
-                                }
-                            }
-                            Some(Err(_)) | None => {
-                                shutdown.cancel();
-                                break;
-                            }
+                        Some(Err(_)) | None => {
+                            shutdown.cancel();
+                            break;
                         }
                     }
                 }
@@ -170,40 +170,19 @@ pub(crate) async fn handle_socket(socket: WebSocket, state: AppState, who: Socke
 
     let shutdown: CancellationToken = state.shutdown.child_token();
     let auth_handle: AuthHandle = state.auth_handle.clone();
+    let open_signups: bool = state.config.open_signups;
+    let handles = Handles {
+        user_handle: state.user_handle.clone()
+    };
 
     // TODO
     // Each user will be subscribed to various rooms
     // Here, we need to take the broadcast channels from each room to which the user belongs,
     // and "merge" each of the broadcast channels into the mpsc so the handler listens on a single channel.
     let (user_tx, user_rx) = tokio::sync::mpsc::channel::<ServerEvent>(100);
-    let test_tx = user_tx.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let _ = test_tx
-            .send(ServerEvent::Message {
-                user_id: Uuid::now_v7(),
-                room_id: Uuid::now_v7(),
-                value: "TESTING".to_owned(),
-            })
-            .await;
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let _ = test_tx
-            .send(ServerEvent::Message {
-                user_id: Uuid::now_v7(),
-                room_id: Uuid::now_v7(),
-                value: "TESTING2".to_owned(),
-            })
-            .await;
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let _ = test_tx
-            .send(ServerEvent::Close {
-                reason: "".to_owned(),
-            })
-            .await;
-    });
 
     let recv_task =
-        spawn_receiver_task(receiver, shutdown.clone(), user_tx, auth_handle, who).await;
+        spawn_receiver_task(receiver, shutdown.clone(), user_tx, auth_handle, handles, open_signups, who).await;
 
     let send_task = spawn_sender_task(sender, shutdown.clone(), user_rx, who).await;
 
@@ -213,6 +192,9 @@ pub(crate) async fn handle_socket(socket: WebSocket, state: AppState, who: Socke
 async fn process_message(
     msg: Message,
     user_tx: &mut tokio::sync::mpsc::Sender<ServerEvent>,
+    handles: &Handles,
+    open_signups: bool,
+    user_id: Uuid,
     who: SocketAddr,
 ) -> ControlFlow<(), ()> {
     match msg {
@@ -246,6 +228,37 @@ async fn process_message(
                     ClientCommand::Error { .. } => {
                         // ERROR from the CLIENT
                     }
+                    ClientCommand::NewUser {
+                        username,
+                        password,
+                        first_name,
+                        last_name,
+                        alias
+                    } => {
+                        // When signups are closed, only admins may create users.
+                        // Validate admin rights just-in-time for this request
+                        // rather than trusting a value cached at connect time.
+                        let allowed = open_signups
+                            || handles.user_handle.is_admin(user_id).await;
+                        if !allowed {
+                            // TODO - Logging
+                            let _ = user_tx.send(ServerEvent::NoUserCreated).await;
+                        } else {
+                            match new_user(&handles.user_handle, username, password, first_name, last_name, alias).await {
+                                UserResponse::UserCreated { .. } => {
+                                    let _ = user_tx.send(ServerEvent::UserCreated).await;
+                                }
+                                UserResponse::Failed => {
+                                    // TODO - Logging
+                                    let _ = user_tx.send(ServerEvent::NoUserCreated).await;
+                                }
+                                _ => {
+                                    // TODO - Logging
+                                    let _ = user_tx.send(ServerEvent::NoUserCreated).await;
+                                }
+                            }
+                        }
+                    },
                 },
                 Err(e) => {
                     println!("ERR: {:?}", e);
@@ -304,4 +317,84 @@ async fn process_message(
         }
     }
     ControlFlow::Continue(())
+}
+
+async fn new_user(
+    user_handle: &UserHandle,
+    username: String,
+    password: Password, 
+    first_name: Option<String>, 
+    last_name: Option<String>, 
+    alias: Option<String>
+) -> UserResponse {
+    user_handle.new_user(
+        NewUser {
+            username: username.to_owned(),
+            first_name,
+            last_name,
+            alias
+        },
+        NewCredential{
+            password: password
+        }
+    ).await
+}
+
+async fn prelude(
+    receiver: &mut SplitStream<WebSocket>,
+    auth_handle: &AuthHandle,
+    user_handle: &UserHandle,
+    open_signups: bool,
+) -> (Uuid, ServerEvent) {
+    tokio::select! {
+        maybe_auth = receiver.next() => {
+            match maybe_auth {
+                Some(Ok(Message::Text(t))) => {
+                    match serde_json::from_str::<ClientCommand>(&t) {
+                        Ok(ClientCommand::Auth{username, password}) => {
+                            match auth_handle.authenticate(username, password).await {
+                                AuthResult::Ok { user_id } => (user_id, ServerEvent::AuthOk),
+                                AuthResult::Failed => (Uuid::nil(), ServerEvent::NoAuth),
+                            }
+                        },
+                        // Unauthenticated user creation is only allowed when open
+                        // signups are enabled in the config; otherwise reject it.
+                        Ok(ClientCommand::NewUser { .. }) if !open_signups => {
+                            // TODO - Logging
+                            (Uuid::nil(), ServerEvent::NoAuth)
+                        }
+                        Ok(ClientCommand::NewUser {
+                            username,
+                            password,
+                            first_name,
+                            last_name,
+                            alias
+                        }) => {
+                            match new_user(&user_handle, username, password, first_name, last_name, alias).await {
+                                UserResponse::UserCreated { user_id } => { (user_id, ServerEvent::UserCreated ) }
+                                UserResponse::Failed => {
+                                    // TODO - Logging
+                                    (Uuid::nil(), ServerEvent::NoUserCreated)
+                                }
+                                _ => { 
+                                    // TODO - Logging
+                                    (Uuid::nil(), ServerEvent::NoUserCreated)
+                                }
+                            }
+                        },
+                        Err(_e) => {
+                            // TODO - Logging
+                            (Uuid::nil(), ServerEvent::NoAuth)
+                        }
+                        _ => (Uuid::nil(), ServerEvent::NoAuth)
+                    }
+                }
+                Some(Err(_e)) => {
+                    // TODO - Logging
+                    (Uuid::nil(), ServerEvent::NoAuth)
+                }
+                _ => (Uuid::nil(), ServerEvent::NoAuth)
+            }
+        }
+    }
 }
