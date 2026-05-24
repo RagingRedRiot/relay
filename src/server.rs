@@ -9,12 +9,12 @@ use std::{net::SocketAddr, num::NonZeroU32, ops::ControlFlow};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::model::{NewCredential, NewUser};
+use crate::model::{EditUser, NewCredential, NewUser};
 use crate::user::{UserHandle, UserResponse};
 use crate::{
     app::AppState,
     auth::{AuthHandle, AuthResult},
-    model::{ClientCommand, ServerEvent, Password},
+    model::{ClientCommand, Password, ServerEvent},
 };
 
 struct Handles {
@@ -80,40 +80,53 @@ async fn spawn_receiver_task(
     who: SocketAddr,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let (user_id, server_event) = prelude(
+            &mut receiver,
+            &auth_handle,
+            &handles.user_handle,
+            open_signups,
+        )
+        .await;
 
-        let (user_id, server_event) = prelude(&mut receiver, &auth_handle, &handles.user_handle, open_signups).await;
-
-        match server_event{
+        match server_event {
             ServerEvent::AuthOk => {
                 let _ = user_tx.send(ServerEvent::AuthOk).await;
             }
             // Anything but AuthOk results in shutdown
             ServerEvent::NoAuth => {
                 let _ = user_tx.send(ServerEvent::NoAuth).await;
-                let _ = user_tx.send(
-                    ServerEvent::Close { reason: "auth failed".to_owned() }
-                ).await;
-                return
+                let _ = user_tx
+                    .send(ServerEvent::Close {
+                        reason: "auth failed".to_owned(),
+                    })
+                    .await;
+                return;
             }
             ServerEvent::UserCreated => {
                 let _ = user_tx.send(ServerEvent::UserCreated).await;
-                let _ = user_tx.send(
-                    ServerEvent::Close { reason: "user created".to_owned() }
-                ).await;
-                return
+                let _ = user_tx
+                    .send(ServerEvent::Close {
+                        reason: "user created".to_owned(),
+                    })
+                    .await;
+                return;
             }
-            ServerEvent::NoUserCreated => {
-                let _ = user_tx.send(ServerEvent::NoUserCreated).await;
-                let _ = user_tx.send(
-                    ServerEvent::Close { reason: "user creation failed".to_owned() }
-                ).await;
-                return
+            ServerEvent::Failed => {
+                let _ = user_tx.send(ServerEvent::Failed).await;
+                let _ = user_tx
+                    .send(ServerEvent::Close {
+                        reason: "user creation failed".to_owned(),
+                    })
+                    .await;
+                return;
             }
             _ => {
-                let _ = user_tx.send(
-                    ServerEvent::Close { reason: "invalid command".to_owned() }
-                ).await;
-                return
+                let _ = user_tx
+                    .send(ServerEvent::Close {
+                        reason: "invalid command".to_owned(),
+                    })
+                    .await;
+                return;
             }
         };
 
@@ -137,7 +150,7 @@ async fn spawn_receiver_task(
                                     }
                                 }
                                 Err(_) => {
-                                    limiter_count = limiter_count + 1;
+                                    limiter_count += 1;
 
                                     if limiter_count > 3 {
                                         let _ = user_tx.send(
@@ -172,7 +185,7 @@ pub(crate) async fn handle_socket(socket: WebSocket, state: AppState, who: Socke
     let auth_handle: AuthHandle = state.auth_handle.clone();
     let open_signups: bool = state.config.open_signups;
     let handles = Handles {
-        user_handle: state.user_handle.clone()
+        user_handle: state.user_handle.clone(),
     };
 
     // TODO
@@ -181,8 +194,16 @@ pub(crate) async fn handle_socket(socket: WebSocket, state: AppState, who: Socke
     // and "merge" each of the broadcast channels into the mpsc so the handler listens on a single channel.
     let (user_tx, user_rx) = tokio::sync::mpsc::channel::<ServerEvent>(100);
 
-    let recv_task =
-        spawn_receiver_task(receiver, shutdown.clone(), user_tx, auth_handle, handles, open_signups, who).await;
+    let recv_task = spawn_receiver_task(
+        receiver,
+        shutdown.clone(),
+        user_tx,
+        auth_handle,
+        handles,
+        open_signups,
+        who,
+    )
+    .await;
 
     let send_task = spawn_sender_task(sender, shutdown.clone(), user_rx, who).await;
 
@@ -233,32 +254,87 @@ async fn process_message(
                         password,
                         first_name,
                         last_name,
-                        alias
+                        alias,
                     } => {
                         // When signups are closed, only admins may create users.
                         // Validate admin rights just-in-time for this request
                         // rather than trusting a value cached at connect time.
-                        let allowed = open_signups
-                            || handles.user_handle.is_admin(user_id).await;
+                        let allowed = open_signups || handles.user_handle.is_admin(user_id).await;
                         if !allowed {
                             // TODO - Logging
-                            let _ = user_tx.send(ServerEvent::NoUserCreated).await;
+                            let _ = user_tx.send(ServerEvent::Failed).await;
                         } else {
-                            match new_user(&handles.user_handle, username, password, first_name, last_name, alias).await {
+                            match new_user(
+                                &handles.user_handle,
+                                username,
+                                password,
+                                first_name,
+                                last_name,
+                                alias,
+                            )
+                            .await
+                            {
                                 UserResponse::UserCreated { .. } => {
                                     let _ = user_tx.send(ServerEvent::UserCreated).await;
                                 }
-                                UserResponse::Failed => {
-                                    // TODO - Logging
-                                    let _ = user_tx.send(ServerEvent::NoUserCreated).await;
-                                }
                                 _ => {
                                     // TODO - Logging
-                                    let _ = user_tx.send(ServerEvent::NoUserCreated).await;
+                                    let _ = user_tx.send(ServerEvent::Failed).await;
                                 }
                             }
                         }
-                    },
+                    }
+                    ClientCommand::EditUser {
+                        target,
+                        username,
+                        first_name,
+                        last_name,
+                        alias,
+                    } => {
+                        match handles
+                            .user_handle
+                            .edit_user(
+                                user_id,
+                                &target,
+                                EditUser {
+                                    username,
+                                    first_name,
+                                    last_name,
+                                    alias,
+                                },
+                            )
+                            .await
+                        {
+                            UserResponse::Success => {
+                                let _ = user_tx.send(ServerEvent::Success).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+                    ClientCommand::GetUserByUsername { username } => {
+                        match handles.user_handle.get_user_by_username(&username).await {
+                            UserResponse::UserInfo { user_info } => {
+                                let _ = user_tx
+                                    .send(ServerEvent::UserInfo {
+                                        first_name: user_info.first_name,
+                                        last_name: user_info.last_name,
+                                        alias: user_info.alias,
+                                        username: user_info.username,
+                                        created_at: user_info.created_at,
+                                    })
+                                    .await;
+                            }
+                            UserResponse::NoUserExists => {
+                                let _ = user_tx.send(ServerEvent::NoUserExists).await;
+                            }
+                            _ => {
+                                // TODO - Logging
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
                 },
                 Err(e) => {
                     println!("ERR: {:?}", e);
@@ -322,22 +398,22 @@ async fn process_message(
 async fn new_user(
     user_handle: &UserHandle,
     username: String,
-    password: Password, 
-    first_name: Option<String>, 
-    last_name: Option<String>, 
-    alias: Option<String>
+    password: Password,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    alias: Option<String>,
 ) -> UserResponse {
-    user_handle.new_user(
-        NewUser {
-            username: username.to_owned(),
-            first_name,
-            last_name,
-            alias
-        },
-        NewCredential{
-            password: password
-        }
-    ).await
+    user_handle
+        .new_user(
+            NewUser {
+                username: username.to_owned(),
+                first_name,
+                last_name,
+                alias,
+            },
+            NewCredential { password },
+        )
+        .await
 }
 
 async fn prelude(
@@ -370,15 +446,15 @@ async fn prelude(
                             last_name,
                             alias
                         }) => {
-                            match new_user(&user_handle, username, password, first_name, last_name, alias).await {
+                            match new_user(user_handle, username, password, first_name, last_name, alias).await {
                                 UserResponse::UserCreated { user_id } => { (user_id, ServerEvent::UserCreated ) }
                                 UserResponse::Failed => {
                                     // TODO - Logging
-                                    (Uuid::nil(), ServerEvent::NoUserCreated)
+                                    (Uuid::nil(), ServerEvent::Failed)
                                 }
-                                _ => { 
+                                _ => {
                                     // TODO - Logging
-                                    (Uuid::nil(), ServerEvent::NoUserCreated)
+                                    (Uuid::nil(), ServerEvent::Failed)
                                 }
                             }
                         },

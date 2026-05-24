@@ -28,7 +28,7 @@ async fn http_requests_over_burst_are_rejected(pool: PgPool) {
         "first request blocked — limiter misconfigured"
     );
     assert!(
-        statuses.iter().any(|&s| s == 429),
+        statuses.contains(&429),
         "expected at least one 429, got {statuses:?}"
     );
 }

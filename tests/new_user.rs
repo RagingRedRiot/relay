@@ -77,7 +77,7 @@ async fn non_admin_denied_when_signups_closed(pool: PgPool) {
     let mut ws = create_socket(server.addr).await;
     authenticate(&mut ws, "bob", "bobpw").await;
     send_cmd(&mut ws, &new_user_cmd("newbie", "newbiepw")).await;
-    assert_eq!(next_event(&mut ws).await, ServerEvent::NoUserCreated);
+    assert_eq!(next_event(&mut ws).await, ServerEvent::Failed);
     close_socket(&mut ws).await;
 }
 

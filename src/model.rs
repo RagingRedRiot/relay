@@ -20,9 +20,19 @@ pub enum ClientCommand {
         room_id: Uuid,
         value: String,
     },
-    NewUser{
+    NewUser {
         username: String,
         password: Password,
+        first_name: Option<String>,
+        last_name: Option<String>,
+        alias: Option<String>,
+    },
+    GetUserByUsername {
+        username: String,
+    },
+    EditUser {
+        target: String,
+        username: Option<String>,
         first_name: Option<String>,
         last_name: Option<String>,
         alias: Option<String>,
@@ -52,13 +62,22 @@ pub enum ServerEvent {
         reason: String,
     },
     UserCreated,
-    NoUserCreated,
     Error {
         error: String,
     },
     RateLimit {
         error: String,
     },
+    UserInfo {
+        first_name: Option<String>,
+        last_name: Option<String>,
+        alias: Option<String>,
+        username: String,
+        created_at: DateTime<Utc>,
+    },
+    NoUserExists,
+    Success,
+    Failed,
 }
 
 macro_rules! json_display {
@@ -86,14 +105,21 @@ pub struct NewUser {
     pub alias: Option<String>,
 }
 
-#[derive(sqlx::FromRow, Debug)]
+pub struct EditUser {
+    pub username: Option<String>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub alias: Option<String>,
+}
+
+#[derive(sqlx::FromRow, Debug, Serialize, Deserialize, PartialEq)]
 pub struct User {
     pub first_name: Option<String>,
     pub last_name: Option<String>,
     pub alias: Option<String>,
     pub username: String,
-    user_id: Uuid,
-    created_at: DateTime<Utc>,
+    pub user_id: Uuid,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -101,13 +127,13 @@ pub struct Admin {
     pub user_id: Uuid,
     pub granted_by: Option<Uuid>,
     pub granted_at: DateTime<Utc>,
-    is_default: bool,
+    pub is_default: bool,
 }
 
 #[derive(sqlx::FromRow)]
 pub struct LastActive {
-    user_id: Uuid,
-    last_active: DateTime<Utc>,
+    pub user_id: Uuid,
+    pub last_active: DateTime<Utc>,
 }
 
 #[derive(sqlx::Type)]
@@ -137,9 +163,9 @@ pub struct NewCredential {
 
 #[derive(sqlx::FromRow)]
 pub struct Credential {
-    user_id: Uuid,
-    password_hash: PasswordHash,
-    password_last_set: DateTime<Utc>,
+    pub user_id: Uuid,
+    pub password_hash: PasswordHash,
+    pub password_last_set: DateTime<Utc>,
 }
 
 pub struct NewRoom {
@@ -161,31 +187,31 @@ pub struct RoomWithOwner {
 }
 
 pub struct NewMessage {
-    room_id: Uuid,
-    user_id: Uuid, // Foreign Key for Creation
-    content: String,
+    pub room_id: Uuid,
+    pub user_id: Uuid, // Foreign Key for Creation
+    pub content: String,
 }
 
 #[derive(sqlx::FromRow)]
 pub struct Message {
-    message_id: Uuid,
-    room_id: Uuid,
-    sender_id: Uuid,
-    content: String,
-    timestamp: DateTime<Utc>,
+    pub message_id: Uuid,
+    pub room_id: Uuid,
+    pub sender_id: Uuid,
+    pub content: String,
+    pub timestamp: DateTime<Utc>,
 }
 
 // Joined View -- Constructed at the query level
 pub struct MessageWithUser {
-    message_id: Uuid,
-    room_id: Room,
-    sender: User,
-    content: String,
-    timestamp: DateTime<Utc>,
+    pub message_id: Uuid,
+    pub room_id: Room,
+    pub sender: User,
+    pub content: String,
+    pub timestamp: DateTime<Utc>,
 }
 
 #[derive(sqlx::FromRow)]
 pub struct Membership {
-    room_id: Uuid,
-    user_id: Uuid,
+    pub room_id: Uuid,
+    pub user_id: Uuid,
 }

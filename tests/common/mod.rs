@@ -58,7 +58,11 @@ pub async fn spawn_app(pool: PgPool, configure: impl FnOnce(&mut Config)) -> Tes
         }
     });
 
-    TestServer { addr, pool, shutdown }
+    TestServer {
+        addr,
+        pool,
+        shutdown,
+    }
 }
 
 // ##### Seeding #####
@@ -179,5 +183,42 @@ pub fn new_user_cmd(username: &str, password: &str) -> ClientCommand {
         first_name: None,
         last_name: None,
         alias: None,
+    }
+}
+
+pub fn get_user_by_username_cmd(username: &str) -> ClientCommand {
+    ClientCommand::GetUserByUsername {
+        username: username.to_string(),
+    }
+}
+
+// Mirror of ServerEvent::UserInfo minus the dynamic `created_at`, so tests
+// can compare profile state with a single assert_eq.
+#[derive(Debug, PartialEq)]
+pub struct UserInfoFields {
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub alias: Option<String>,
+    pub username: String,
+}
+
+// Send GetUserByUsername and parse the UserInfo response. Panics on any
+// other event so the test fails at the call site instead of later.
+pub async fn fetch_user_info(ws: &mut Ws, target_username: &str) -> UserInfoFields {
+    send_cmd(ws, &get_user_by_username_cmd(target_username)).await;
+    match next_event(ws).await {
+        ServerEvent::UserInfo {
+            first_name,
+            last_name,
+            alias,
+            username,
+            created_at: _,
+        } => UserInfoFields {
+            first_name,
+            last_name,
+            alias,
+            username,
+        },
+        other => panic!("expected UserInfo for {target_username:?}, got {other:?}"),
     }
 }
