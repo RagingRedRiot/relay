@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::{SaltString, rand_core::OsRng}};
+use argon2::{
+    Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
+    password_hash::{SaltString, rand_core::OsRng},
+};
 use sqlx::PgPool;
 use tokio::{
     select,
@@ -50,47 +53,57 @@ impl AuthHandle {
     }
 }
 
-async fn authenticate(username: String, password: Password, dummy_hash: Arc<String>, pool: PgPool) -> AuthResult {
+async fn authenticate(
+    username: String,
+    password: Password,
+    dummy_hash: Arc<String>,
+    pool: PgPool,
+) -> AuthResult {
     let row: Option<(Uuid, String)> = match sqlx::query_as(
         "SELECT u.user_id, c.password_hash
         FROM users u
         JOIN credentials c USING (user_id)
-        WHERE u.username = $1"
+        WHERE u.username = $1",
     )
     .bind(&username)
     .fetch_optional(&pool)
-    .await {
-        Ok(maybe_data) => { maybe_data }
-        Err(_e) => { 
+    .await
+    {
+        Ok(maybe_data) => maybe_data,
+        Err(_e) => {
             // TODO - Logging
-            return AuthResult::Failed
+            return AuthResult::Failed;
         }
     };
 
     let (user_id, verified) = match row {
         Some((user_id, hash)) => {
             let parsed = match PasswordHash::new(&hash) {
-                Ok(parsed) => { parsed }
-                Err(_e) => { 
+                Ok(parsed) => parsed,
+                Err(_e) => {
                     // TODO - Logging
-                    return AuthResult::Failed
+                    return AuthResult::Failed;
                 }
             };
-            let verified = Argon2::default().verify_password(password.0.as_bytes(), &parsed).is_ok();
+            let verified = Argon2::default()
+                .verify_password(password.0.as_bytes(), &parsed)
+                .is_ok();
             (user_id, verified)
         }
         None => {
             // User Doesn't Exist
             // Perform a dummy check to take the same amount of time as if the user exists
             let parsed = match PasswordHash::new(&dummy_hash) {
-                Ok(parsed) => { parsed }
-                Err(_e) => { 
+                Ok(parsed) => parsed,
+                Err(_e) => {
                     // TODO - Logging
-                    return AuthResult::Failed
+                    return AuthResult::Failed;
                 }
             };
-            let _ = Argon2::default().verify_password(password.0.as_bytes(), &parsed).is_ok();
-            return AuthResult::Failed
+            let _ = Argon2::default()
+                .verify_password(password.0.as_bytes(), &parsed)
+                .is_ok();
+            return AuthResult::Failed;
         }
     };
 
@@ -110,11 +123,11 @@ pub async fn spawn(shutdown: CancellationToken, pool: PgPool) -> AuthHandle {
     let (tx, mut rx) = mpsc::channel::<AuthRequest>(100);
 
     let dummy: String = {
-      let salt = SaltString::generate(&mut OsRng);
-      Argon2::default()
-          .hash_password(b"dummy", &salt)
-          .expect("hash dummy password")
-          .to_string()
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(b"dummy", &salt)
+            .expect("hash dummy password")
+            .to_string()
     };
 
     let dummy_hash = Arc::new(dummy);

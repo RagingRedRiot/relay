@@ -40,6 +40,14 @@ pub enum ClientCommand {
     DeleteUser {
         target_username: String,
     },
+    UpdatePassword {
+        current_password: Password,
+        new_password: Password,
+    },
+    ResetPassword {
+        target_username: String,
+        new_password: Password,
+    },
     Close,
     Error {
         error: String,

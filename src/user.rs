@@ -1,7 +1,4 @@
-use argon2::{
-    Argon2, PasswordHasher,
-    password_hash::{SaltString, rand_core::OsRng},
-};
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use sqlx::{PgConnection, PgPool, Row, postgres::PgRow};
 use tokio::{
     select,
@@ -10,12 +7,15 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::model::{self, Admin, EditUser, NewCredential, NewUser, User};
+use crate::{
+    actor::generate_hash,
+    model::{self, Admin, EditUser, NewCredential, NewUser, Password, User},
+};
 
 pub enum UserRequest {
     NewUserRequest {
         user: model::NewUser,
-        credential: model::NewCredential,
+        credential: NewCredential,
         tx: oneshot::Sender<UserResponse>,
     },
     GetUserInfoRequest {
@@ -42,6 +42,18 @@ pub enum UserRequest {
     DeleteUserRequest {
         source_user_id: Uuid,
         target_username: String,
+        tx: oneshot::Sender<UserResponse>,
+    },
+    UpdatePassword {
+        source_user_id: Uuid,
+        current_password: Password,
+        new_password: Password,
+        tx: oneshot::Sender<UserResponse>,
+    },
+    ResetPassword {
+        source_user_id: Uuid,
+        target_username: String,
+        new_password: Password,
         tx: oneshot::Sender<UserResponse>,
     },
 }
@@ -170,10 +182,55 @@ impl UserHandle {
         rx.await.unwrap_or(UserResponse::Failed)
     }
 
-    // TODO
-    // pub async fn get_user(&self, user_id: Uuid) -> UserResponse {
+    pub async fn update_password(
+        &self,
+        source_user_id: Uuid,
+        current_password: Password,
+        new_password: Password,
+    ) -> UserResponse {
+        let (tx, rx) = oneshot::channel();
 
-    // }
+        if self
+            .sender
+            .send(UserRequest::UpdatePassword {
+                source_user_id,
+                current_password,
+                new_password,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return UserResponse::Failed;
+        }
+
+        rx.await.unwrap_or(UserResponse::Failed)
+    }
+
+    pub async fn reset_password(
+        &self,
+        source_user_id: Uuid,
+        target_username: String,
+        new_password: Password,
+    ) -> UserResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(UserRequest::ResetPassword {
+                source_user_id,
+                target_username,
+                new_password,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return UserResponse::Failed;
+        }
+
+        rx.await.unwrap_or(UserResponse::Failed)
+    }
 }
 
 pub async fn spawn(shutdown: CancellationToken, pool: PgPool) -> UserHandle {
@@ -203,14 +260,6 @@ pub async fn spawn(shutdown: CancellationToken, pool: PgPool) -> UserHandle {
 
     // USER ACTOR HANDLE
     UserHandle { sender: tx }
-}
-
-fn generate_hash(credential: NewCredential) -> Result<String, argon2::password_hash::Error> {
-    let salt = SaltString::generate(&mut OsRng);
-    let hash = Argon2::default()
-        .hash_password(credential.password.0.as_bytes(), &salt)?
-        .to_string();
-    Ok(hash)
 }
 
 async fn handle_request(
@@ -416,6 +465,186 @@ async fn handle_request(
             } else if success {
                 (UserResponse::UserDeleted { is_self: false }, tx)
             } else {
+                (UserResponse::Failed, tx)
+            }
+        }
+
+        UserRequest::UpdatePassword {
+            source_user_id,
+            current_password,
+            new_password,
+            tx,
+        } => {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            };
+
+            // The default admin's credentials are config-managed (set at
+            // boot via ensure_admin); they must not be mutable from the
+            // app, even by the default admin itself.
+            let source_is_default = match get_admin(&mut db, source_user_id).await {
+                Ok(Some(admin)) => admin.is_default,
+                Ok(None) => false,
+                Err(_) => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            };
+            if source_is_default {
+                // TODO - Logging
+                return (UserResponse::Failed, tx);
+            }
+
+            let verified = verify_password(&mut db, source_user_id, current_password).await;
+
+            if verified {
+                let hash = match generate_hash(NewCredential {
+                    password: new_password,
+                }) {
+                    Ok(hash) => hash,
+                    Err(_e) => {
+                        // TODO - Logging
+                        return (UserResponse::Failed, tx);
+                    }
+                };
+
+                let row = match sqlx::query(
+                    "UPDATE credentials
+                    SET password_hash = $1,
+                        password_last_set = NOW()
+                    WHERE user_id = $2",
+                )
+                .bind(hash)
+                .bind(source_user_id)
+                .execute(&mut *db)
+                .await
+                {
+                    Ok(res) => res,
+                    Err(_e) => {
+                        // TODO - Logging
+                        return (UserResponse::Failed, tx);
+                    }
+                }
+                .rows_affected();
+
+                if row == 1 {
+                    (UserResponse::Success, tx)
+                } else {
+                    // TODO - Logging
+                    (UserResponse::Failed, tx)
+                }
+            } else {
+                // TODO - Logging
+                (UserResponse::Failed, tx)
+            }
+        }
+
+        UserRequest::ResetPassword {
+            source_user_id,
+            target_username,
+            new_password,
+            tx,
+        } => {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            };
+
+            let (source_is_admin, source_is_default) =
+                match get_admin(&mut db, source_user_id).await {
+                    Ok(is_admin) => match is_admin {
+                        Some(admin) => (true, admin.is_default),
+                        None => (false, false),
+                    },
+                    Err(_) => {
+                        // TODO - Logging
+                        return (UserResponse::Failed, tx);
+                    }
+                };
+
+            // Non-admins cannot use ResetPassword
+            if !source_is_admin {
+                return (UserResponse::Failed, tx);
+            }
+
+            // Translate Username into UserID
+            let user_response = match get_user_by_username(&mut db, &target_username).await {
+                Ok(res) => res,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            };
+            let target_user_id: Uuid = match user_response {
+                UserResponse::UserInfo { user_info } => user_info.user_id,
+                _ => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            };
+
+            // Admins can change other user passwords, but not their own
+            if target_user_id == source_user_id {
+                return (UserResponse::Failed, tx);
+            }
+
+            let (target_is_admin, target_is_default) =
+                match get_admin(&mut db, target_user_id).await {
+                    Ok(is_admin) => match is_admin {
+                        Some(admin) => (true, admin.is_default),
+                        None => (false, false),
+                    },
+                    Err(_) => {
+                        // TODO - Logging
+                        return (UserResponse::Failed, tx);
+                    }
+                };
+
+            // Only the Default Admin can reset the password of admins
+            if target_is_admin && !source_is_default || target_is_default {
+                return (UserResponse::Failed, tx);
+            }
+
+            let hash = match generate_hash(NewCredential {
+                password: new_password,
+            }) {
+                Ok(hash) => hash,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            };
+
+            let row = match sqlx::query(
+                "UPDATE credentials
+                SET password_hash = $1,
+                    password_last_set = NOW()
+                WHERE user_id = $2",
+            )
+            .bind(hash)
+            .bind(target_user_id)
+            .execute(&mut *db)
+            .await
+            {
+                Ok(res) => res,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            }
+            .rows_affected();
+
+            if row == 1 {
+                (UserResponse::Success, tx)
+            } else {
+                // TODO - Logging
                 (UserResponse::Failed, tx)
             }
         }
@@ -639,4 +868,30 @@ pub async fn ensure_admin(
     db.commit().await?;
 
     Ok(())
+}
+
+async fn verify_password(db: &mut PgConnection, user_id: Uuid, password: Password) -> bool {
+    let maybe_cred: Option<String> =
+        match sqlx::query_scalar("SELECT password_hash FROM credentials WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_optional(db)
+            .await
+        {
+            Ok(maybe_cred) => maybe_cred,
+            Err(_) => return false,
+        };
+
+    match maybe_cred {
+        Some(cred) => {
+            let parsed = match PasswordHash::new(&cred) {
+                Ok(parsed) => parsed,
+                Err(_e) => return false,
+            };
+
+            Argon2::default()
+                .verify_password(password.0.as_bytes(), &parsed)
+                .is_ok()
+        }
+        None => false,
+    }
 }

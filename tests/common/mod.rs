@@ -194,6 +194,31 @@ pub async fn close_socket(ws: &mut Ws) {
     expect_close(ws).await;
 }
 
+// Open a fresh socket, authenticate, and close. Asserts AuthOk.
+// Useful for "after rotation, the new password works" assertions.
+pub async fn assert_password_works(addr: SocketAddr, username: &str, password: &str) {
+    let mut ws = create_socket(addr).await;
+    authenticate(&mut ws, username, password).await;
+    close_socket(&mut ws).await;
+}
+
+// Open a fresh socket, send Auth, and assert the server rejects it.
+// The server's policy on auth failure is NoAuth followed by Close, so we
+// assert both. Useful for "after rotation, the old password no longer works".
+pub async fn assert_password_fails(addr: SocketAddr, username: &str, password: &str) {
+    let mut ws = create_socket(addr).await;
+    send_cmd(
+        &mut ws,
+        &ClientCommand::Auth {
+            username: username.to_owned(),
+            password: Password(password.to_owned()),
+        },
+    )
+    .await;
+    assert_eq!(next_event(&mut ws).await, ServerEvent::NoAuth);
+    expect_close(&mut ws).await;
+}
+
 pub fn new_user_cmd(username: &str, password: &str) -> ClientCommand {
     ClientCommand::NewUser {
         username: username.to_owned(),

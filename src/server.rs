@@ -361,6 +361,42 @@ async fn process_message(
                             }
                         }
                     }
+
+                    ClientCommand::UpdatePassword {
+                        current_password,
+                        new_password,
+                    } => {
+                        match handles
+                            .user_handle
+                            .update_password(user_id, current_password, new_password)
+                            .await
+                        {
+                            UserResponse::Success => {
+                                let _ = user_tx.send(ServerEvent::Success).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+
+                    ClientCommand::ResetPassword {
+                        target_username,
+                        new_password,
+                    } => {
+                        match handles
+                            .user_handle
+                            .reset_password(user_id, target_username, new_password)
+                            .await
+                        {
+                            UserResponse::Success => {
+                                let _ = user_tx.send(ServerEvent::Success).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
                 },
                 Err(e) => {
                     println!("ERR: {:?}", e);
@@ -456,7 +492,7 @@ async fn prelude(
                         Ok(ClientCommand::Auth{username, password}) => {
                             match auth_handle.authenticate(username, password).await {
                                 AuthResult::Ok { user_id } => (user_id, ServerEvent::AuthOk),
-                                AuthResult::Failed => (Uuid::nil(), ServerEvent::NoAuth),
+                                _ => (Uuid::nil(), ServerEvent::NoAuth),
                             }
                         },
                         // Unauthenticated user creation is only allowed when open
