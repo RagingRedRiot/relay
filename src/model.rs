@@ -31,11 +31,14 @@ pub enum ClientCommand {
         username: String,
     },
     EditUser {
-        target: String,
+        target_username: String,
         username: Option<String>,
         first_name: Option<String>,
         last_name: Option<String>,
         alias: Option<String>,
+    },
+    DeleteUser {
+        target_username: String,
     },
     Close,
     Error {

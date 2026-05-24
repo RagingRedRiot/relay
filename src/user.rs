@@ -39,6 +39,11 @@ pub enum UserRequest {
         alias: Option<String>,
         tx: oneshot::Sender<UserResponse>,
     },
+    DeleteUserRequest {
+        source_user_id: Uuid,
+        target_username: String,
+        tx: oneshot::Sender<UserResponse>,
+    },
 }
 
 #[derive(Debug)]
@@ -46,6 +51,7 @@ pub enum UserResponse {
     UserCreated { user_id: Uuid },
     UserInfo { user_info: User },
     IsAdmin { is_admin: bool },
+    UserDeleted { is_self: bool },
     NoUserExists,
     Success,
     Failed,
@@ -115,6 +121,25 @@ impl UserHandle {
                 first_name: edit.first_name,
                 last_name: edit.last_name,
                 alias: edit.alias,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return UserResponse::Failed;
+        }
+
+        rx.await.unwrap_or(UserResponse::Failed)
+    }
+
+    pub async fn delete_user(&self, target_username: &str, source_user_id: Uuid) -> UserResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(UserRequest::DeleteUserRequest {
+                target_username: target_username.to_owned(),
+                source_user_id,
                 tx,
             })
             .await
@@ -250,7 +275,15 @@ async fn handle_request(
         }
 
         UserRequest::IsAdminRequest { user_id, tx } => {
-            match is_admin(&pool, user_id).await {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            };
+
+            match is_admin(&mut db, user_id).await {
                 Ok(value) => (UserResponse::IsAdmin { is_admin: value }, tx),
                 Err(_e) => {
                     // TODO - Logging
@@ -314,6 +347,78 @@ async fn handle_request(
                 }
             }
         }
+
+        UserRequest::DeleteUserRequest {
+            target_username,
+            source_user_id,
+            tx,
+        } => {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            };
+
+            // Translate Username into UserID
+            let user_response = match get_user_by_username(&mut db, &target_username).await {
+                Ok(res) => res,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            };
+            let user_id: Uuid = match user_response {
+                UserResponse::UserInfo { user_info } => user_info.user_id,
+                _ => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            };
+
+            // Check if source user is admin
+            let is_admin: bool = match is_admin(&mut db, source_user_id).await {
+                Ok(maybe_admin) => maybe_admin,
+                Err(_) => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            };
+
+            // If the user source is not an admin or targeting itself, fail
+            if !is_admin && user_id != source_user_id {
+                // TODO - Logging
+                return (UserResponse::Failed, tx);
+            }
+
+            // Check if the target user is Default Admin
+            let maybe_admin: Option<Admin> = match get_admin(&mut db, user_id).await {
+                Ok(maybe_admin) => maybe_admin,
+                Err(_) => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            };
+            let is_default = match maybe_admin {
+                Some(admin) => admin.is_default, // Target user is an admin
+                None => false,                   // Target user is not an admin
+            };
+
+            if is_default {
+                return (UserResponse::Failed, tx); // Don't allow default admin to be deleted, even by admin or itself
+            }
+
+            let success = delete_user(&mut db, user_id).await;
+
+            if source_user_id == user_id && success {
+                (UserResponse::UserDeleted { is_self: true }, tx)
+            } else if success {
+                (UserResponse::UserDeleted { is_self: false }, tx)
+            } else {
+                (UserResponse::Failed, tx)
+            }
+        }
     }
 }
 
@@ -356,7 +461,7 @@ async fn edit_user(
     .await?;
 
     let target_user_id: Option<Uuid> = row.try_get("target_id")?;
-    let is_admin: bool = row.try_get("is_admin")?;
+    let is_source_admin: bool = row.try_get("is_admin")?;
 
     // If the target user does not exist, fail
     let Some(target_user_id) = target_user_id else {
@@ -365,9 +470,26 @@ async fn edit_user(
     };
 
     // If the user is not modifying itself or the user is not an admin, fail
-    if target_user_id != source_user_id && !is_admin {
+    if target_user_id != source_user_id && !is_source_admin {
         // TODO - Logging
         return Ok(UserResponse::Failed);
+    }
+
+    // Check if the target user is Default Admin
+    let maybe_admin: Option<Admin> = match get_admin(db, target_user_id).await {
+        Ok(maybe_admin) => maybe_admin,
+        Err(_) => {
+            // TODO - Logging
+            return Ok(UserResponse::Failed);
+        }
+    };
+    let is_default = match maybe_admin {
+        Some(admin) => admin.is_default, // Target user is an admin
+        None => false,                   // Target user is not an admin
+    };
+
+    if is_default {
+        return Ok(UserResponse::Failed); // Don't allow edits to the default admin
     }
 
     let result = sqlx::query(
@@ -393,6 +515,20 @@ async fn edit_user(
         // Zero rows were changed
         // TODO - Logging
         Ok(UserResponse::Failed)
+    }
+}
+
+async fn delete_user(db: &mut PgConnection, user_id: Uuid) -> bool {
+    match sqlx::query("DELETE FROM users WHERE user_id = $1")
+        .bind(user_id)
+        .execute(db)
+        .await
+    {
+        Ok(res) => res.rows_affected() == 1,
+        Err(_e) => {
+            // TODO - Logging
+            false
+        }
     }
 }
 
@@ -455,7 +591,7 @@ async fn update_admin(
     Ok(())
 }
 
-async fn get_admin(db: &mut PgConnection) -> Result<Option<Admin>, sqlx::Error> {
+async fn get_default_admin(db: &mut PgConnection) -> Result<Option<Admin>, sqlx::Error> {
     let row: Option<Admin> = sqlx::query_as(
         "SELECT user_id, granted_by, granted_at, is_default FROM admins WHERE is_default = true",
     )
@@ -464,13 +600,22 @@ async fn get_admin(db: &mut PgConnection) -> Result<Option<Admin>, sqlx::Error> 
     Ok(row)
 }
 
-async fn is_admin(pool: &PgPool, user_id: Uuid) -> Result<bool, sqlx::Error> {
+async fn is_admin(db: &mut PgConnection, user_id: Uuid) -> Result<bool, sqlx::Error> {
     let is_admin: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM admins WHERE user_id = $1)")
             .bind(user_id)
-            .fetch_one(pool)
+            .fetch_one(db)
             .await?;
     Ok(is_admin)
+}
+
+async fn get_admin(db: &mut PgConnection, user_id: Uuid) -> Result<Option<Admin>, sqlx::Error> {
+    sqlx::query_as::<_, Admin>(
+        "SELECT user_id, granted_by, granted_at, is_default FROM admins where user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
 }
 
 pub async fn ensure_admin(
@@ -480,7 +625,7 @@ pub async fn ensure_admin(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut db: sqlx::Transaction<'_, sqlx::Postgres> = pool.begin().await?;
 
-    let maybe_admin = get_admin(&mut db).await?;
+    let maybe_admin = get_default_admin(&mut db).await?;
 
     let hash = generate_hash(credential)?;
 

@@ -80,6 +80,7 @@ async fn spawn_receiver_task(
     who: SocketAddr,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // PRELUDE - PREAUTH'd
         let (user_id, server_event) = prelude(
             &mut receiver,
             &auth_handle,
@@ -137,6 +138,7 @@ async fn spawn_receiver_task(
 
         let mut limiter_count = 0;
 
+        // AUTH'd
         loop {
             tokio::select! {
                 maybe_msg = receiver.next() => {
@@ -285,7 +287,7 @@ async fn process_message(
                         }
                     }
                     ClientCommand::EditUser {
-                        target,
+                        target_username,
                         username,
                         first_name,
                         last_name,
@@ -295,7 +297,7 @@ async fn process_message(
                             .user_handle
                             .edit_user(
                                 user_id,
-                                &target,
+                                &target_username,
                                 EditUser {
                                     username,
                                     first_name,
@@ -328,6 +330,30 @@ async fn process_message(
                             }
                             UserResponse::NoUserExists => {
                                 let _ = user_tx.send(ServerEvent::NoUserExists).await;
+                            }
+                            _ => {
+                                // TODO - Logging
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+                    ClientCommand::DeleteUser { target_username } => {
+                        match handles
+                            .user_handle
+                            .delete_user(&target_username, user_id)
+                            .await
+                        {
+                            UserResponse::UserDeleted { is_self } => {
+                                if is_self {
+                                    let _ = user_tx.send(ServerEvent::Success).await;
+                                    let _ = user_tx
+                                        .send(ServerEvent::Close {
+                                            reason: "client closed".to_owned(),
+                                        })
+                                        .await;
+                                } else {
+                                    let _ = user_tx.send(ServerEvent::Success).await;
+                                }
                             }
                             _ => {
                                 // TODO - Logging

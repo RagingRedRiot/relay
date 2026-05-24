@@ -80,6 +80,24 @@ pub async fn seed_admin(pool: &PgPool, username: &str, password: &str) {
     .expect("failed to seed admin");
 }
 
+// Seed a non-default admin: create the user through the normal actor path,
+// then INSERT directly into `admins` with is_default = false. There is no
+// public promote-to-admin command yet, and the `admins_one_default` partial
+// unique index only constrains rows where is_default is true, so multiple
+// non-default admins are fine. Useful for exercising auth paths that depend
+// on the default-admin distinction (e.g. delete_user's is_default guard).
+pub async fn seed_extra_admin(pool: &PgPool, username: &str, password: &str) {
+    seed_user(pool, username, password).await;
+    sqlx::query(
+        "INSERT INTO admins (user_id, is_default)
+         SELECT user_id, false FROM users WHERE username = $1",
+    )
+    .bind(username)
+    .execute(pool)
+    .await
+    .expect("failed to promote user to non-default admin");
+}
+
 // Seed a regular (non-admin) user through the real user actor, so seeding
 // exercises the same code path as production rather than raw SQL.
 pub async fn seed_user(pool: &PgPool, username: &str, password: &str) {

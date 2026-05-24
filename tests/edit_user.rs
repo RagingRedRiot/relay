@@ -16,7 +16,7 @@ async fn user_edits_own_data(pool: PgPool) {
     send_cmd(
         &mut ws,
         &ClientCommand::EditUser {
-            target: "bob".to_owned(),
+            target_username: "bob".to_owned(),
             username: Some("bobby".to_owned()),
             first_name: Some("Bobby".to_owned()),
             last_name: Some("Joel".to_owned()),
@@ -39,20 +39,23 @@ async fn user_edits_own_data(pool: PgPool) {
     close_socket(&mut ws).await;
 }
 
+// Non-default admins can edit themselves; the guard is scoped to the default
+// admin only.
 #[sqlx::test]
-async fn admin_edits_own_data(pool: PgPool) {
+async fn non_default_admin_edits_own_data(pool: PgPool) {
     seed_admin(&pool, "admin", "adminpw").await;
+    seed_extra_admin(&pool, "mod", "modpw").await;
     let server = spawn_app(pool, |_| {}).await;
 
     let mut ws = create_socket(server.addr).await;
-    authenticate(&mut ws, "admin", "adminpw").await;
+    authenticate(&mut ws, "mod", "modpw").await;
 
     send_cmd(
         &mut ws,
         &ClientCommand::EditUser {
-            target: "admin".to_owned(),
+            target_username: "mod".to_owned(),
             username: None,
-            first_name: Some("Ada".to_owned()),
+            first_name: Some("Mod".to_owned()),
             last_name: None,
             alias: None,
         },
@@ -61,12 +64,12 @@ async fn admin_edits_own_data(pool: PgPool) {
     assert_eq!(next_event(&mut ws).await, ServerEvent::Success);
 
     assert_eq!(
-        fetch_user_info(&mut ws, "admin").await,
+        fetch_user_info(&mut ws, "mod").await,
         UserInfoFields {
-            first_name: Some("Ada".to_owned()),
+            first_name: Some("Mod".to_owned()),
             last_name: None,
             alias: None,
-            username: "admin".to_owned(),
+            username: "mod".to_owned(),
         }
     );
 
@@ -87,7 +90,7 @@ async fn admin_edits_other_user(pool: PgPool) {
     send_cmd(
         &mut ws,
         &ClientCommand::EditUser {
-            target: "bob".to_owned(),
+            target_username: "bob".to_owned(),
             username: Some("bobby".to_owned()),
             first_name: Some("Bobby".to_owned()),
             last_name: Some("Joel".to_owned()),
@@ -124,7 +127,7 @@ async fn non_admin_cannot_edit_other_user(pool: PgPool) {
     send_cmd(
         &mut ws,
         &ClientCommand::EditUser {
-            target: "alice".to_owned(),
+            target_username: "alice".to_owned(),
             username: Some("evil".to_owned()),
             first_name: Some("Mallory".to_owned()),
             last_name: None,
@@ -159,7 +162,7 @@ async fn edit_nonexistent_user_fails(pool: PgPool) {
     send_cmd(
         &mut ws,
         &ClientCommand::EditUser {
-            target: "ghost".to_owned(),
+            target_username: "ghost".to_owned(),
             username: None,
             first_name: Some("Hi".to_owned()),
             last_name: None,
@@ -187,7 +190,7 @@ async fn failed_edit_does_not_close_session(pool: PgPool) {
     send_cmd(
         &mut ws,
         &ClientCommand::EditUser {
-            target: "alice".to_owned(),
+            target_username: "alice".to_owned(),
             username: None,
             first_name: Some("Mallory".to_owned()),
             last_name: None,
@@ -201,7 +204,7 @@ async fn failed_edit_does_not_close_session(pool: PgPool) {
     send_cmd(
         &mut ws,
         &ClientCommand::EditUser {
-            target: "bob".to_owned(),
+            target_username: "bob".to_owned(),
             username: None,
             first_name: Some("Bob".to_owned()),
             last_name: None,
@@ -229,7 +232,7 @@ async fn partial_edit_preserves_unchanged_fields(pool: PgPool) {
     send_cmd(
         &mut ws,
         &ClientCommand::EditUser {
-            target: "bob".to_owned(),
+            target_username: "bob".to_owned(),
             username: None,
             first_name: Some("Robert".to_owned()),
             last_name: Some("Smith".to_owned()),
@@ -243,7 +246,7 @@ async fn partial_edit_preserves_unchanged_fields(pool: PgPool) {
     send_cmd(
         &mut ws,
         &ClientCommand::EditUser {
-            target: "bob".to_owned(),
+            target_username: "bob".to_owned(),
             username: None,
             first_name: Some("Bob".to_owned()),
             last_name: None,
@@ -279,7 +282,7 @@ async fn edit_with_no_changes_succeeds(pool: PgPool) {
     send_cmd(
         &mut ws,
         &ClientCommand::EditUser {
-            target: "bob".to_owned(),
+            target_username: "bob".to_owned(),
             username: None,
             first_name: None,
             last_name: None,
@@ -307,7 +310,7 @@ async fn empty_string_fields_overwrite_existing_values(pool: PgPool) {
     send_cmd(
         &mut ws,
         &ClientCommand::EditUser {
-            target: "bob".to_owned(),
+            target_username: "bob".to_owned(),
             username: None,
             first_name: Some("Robert".to_owned()),
             last_name: Some("Smith".to_owned()),
@@ -320,7 +323,7 @@ async fn empty_string_fields_overwrite_existing_values(pool: PgPool) {
     send_cmd(
         &mut ws,
         &ClientCommand::EditUser {
-            target: "bob".to_owned(),
+            target_username: "bob".to_owned(),
             username: None,
             first_name: Some(String::new()),
             last_name: Some(String::new()),
@@ -359,7 +362,7 @@ async fn username_collision_fails(pool: PgPool) {
     send_cmd(
         &mut ws,
         &ClientCommand::EditUser {
-            target: "bob".to_owned(),
+            target_username: "bob".to_owned(),
             username: Some("alice".to_owned()),
             first_name: None,
             last_name: None,
@@ -388,7 +391,7 @@ async fn rename_does_not_break_credentials(pool: PgPool) {
     send_cmd(
         &mut ws,
         &ClientCommand::EditUser {
-            target: "bob".to_owned(),
+            target_username: "bob".to_owned(),
             username: Some("bobby".to_owned()),
             first_name: None,
             last_name: None,
@@ -415,5 +418,109 @@ async fn rename_does_not_break_credentials(pool: PgPool) {
     // The new username with the original password must succeed.
     let mut ws = create_socket(server.addr).await;
     authenticate(&mut ws, "bobby", "bobpw").await;
+    close_socket(&mut ws).await;
+}
+
+// ##### Default admin lockdown #####
+
+// The default admin is config-managed: its username and password come from
+// env at boot via ensure_admin. Allowing edits via the app would let a
+// compromised admin rename it out from under the operator (peek-a-boo),
+// making break-glass login impossible. So self-edits are blocked too.
+#[sqlx::test]
+async fn default_admin_cannot_edit_own_data(pool: PgPool) {
+    seed_admin(&pool, "admin", "adminpw").await;
+    let server = spawn_app(pool, |_| {}).await;
+
+    let mut ws = create_socket(server.addr).await;
+    authenticate(&mut ws, "admin", "adminpw").await;
+
+    send_cmd(
+        &mut ws,
+        &ClientCommand::EditUser {
+            target_username: "admin".to_owned(),
+            username: None,
+            first_name: Some("Ada".to_owned()),
+            last_name: None,
+            alias: None,
+        },
+    )
+    .await;
+    assert_eq!(next_event(&mut ws).await, ServerEvent::Failed);
+
+    // The row is untouched.
+    assert_eq!(
+        fetch_user_info(&mut ws, "admin").await,
+        UserInfoFields {
+            first_name: None,
+            last_name: None,
+            alias: None,
+            username: "admin".to_owned(),
+        }
+    );
+
+    close_socket(&mut ws).await;
+}
+
+// The guard is on the *target*: another admin (non-default) cannot edit the
+// default admin either. This is the peek-a-boo attack the guard is meant to
+// prevent.
+#[sqlx::test]
+async fn non_default_admin_cannot_edit_default_admin(pool: PgPool) {
+    seed_admin(&pool, "admin", "adminpw").await;
+    seed_extra_admin(&pool, "mod", "modpw").await;
+    let server = spawn_app(pool, |_| {}).await;
+
+    let mut ws = create_socket(server.addr).await;
+    authenticate(&mut ws, "mod", "modpw").await;
+
+    send_cmd(
+        &mut ws,
+        &ClientCommand::EditUser {
+            target_username: "admin".to_owned(),
+            username: Some("evil".to_owned()),
+            first_name: None,
+            last_name: None,
+            alias: None,
+        },
+    )
+    .await;
+    assert_eq!(next_event(&mut ws).await, ServerEvent::Failed);
+
+    // The default admin's username must still resolve.
+    assert_eq!(fetch_user_info(&mut ws, "admin").await.username, "admin");
+
+    close_socket(&mut ws).await;
+}
+
+// The guard restricts the target, not the source — the default admin can
+// still edit other users normally.
+#[sqlx::test]
+async fn default_admin_can_edit_other_user(pool: PgPool) {
+    seed_admin(&pool, "admin", "adminpw").await;
+    seed_user(&pool, "bob", "bobpw").await;
+    let server = spawn_app(pool, |_| {}).await;
+
+    let mut ws = create_socket(server.addr).await;
+    authenticate(&mut ws, "admin", "adminpw").await;
+
+    send_cmd(
+        &mut ws,
+        &ClientCommand::EditUser {
+            target_username: "bob".to_owned(),
+            username: None,
+            first_name: Some("Robert".to_owned()),
+            last_name: None,
+            alias: None,
+        },
+    )
+    .await;
+    assert_eq!(next_event(&mut ws).await, ServerEvent::Success);
+
+    assert_eq!(
+        fetch_user_info(&mut ws, "bob").await.first_name,
+        Some("Robert".to_owned())
+    );
+
     close_socket(&mut ws).await;
 }
