@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  detect-test-modifications:
+    name: Detect modifications to existing tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Diff tests/ vs base
+        id: diff
+        shell: bash
+        run: |
+          set -uo pipefail
+          BASE="${{ github.event.pull_request.base.sha }}"
+          REPORT="$RUNNER_TEMP/test-mod-report.md"
+          : > "$REPORT"
+
+          # Files under tests/ that were Modified, Deleted, or Renamed against base.
+          # Pure Additions (new test files) are excluded by --diff-filter.
+          MODIFIED_FILES=$(git diff --diff-filter=MDR --name-only "$BASE...HEAD" -- tests/ || true)
+
+          ANY=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            # Count actual deleted/changed lines (lines starting with single '-',
+            # excluding the '---' file header).
+            DEL=$(git diff "$BASE...HEAD" -- "$f" | grep -c '^-[^-]' || true)
+            if [ "${DEL:-0}" -gt 0 ]; then
+              printf -- '- `%s` (%s line(s) removed or changed)\n' "$f" "$DEL" >> "$REPORT"
+              ANY=true
+            fi
+          done <<< "$MODIFIED_FILES"
+
+          {
+            if $ANY; then
+              echo "## :warning: Existing tests were modified"
+              echo ""
+              cat "$REPORT"
+              echo ""
+              echo "Adding new tests is fine and does not trigger this notice — only edits or removals of existing test code (or helpers under \`tests/common/\`)."
+            else
+              echo "## :white_check_mark: No existing tests were modified"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if $ANY; then
+            echo "modified=true" >> "$GITHUB_OUTPUT"
+            echo "report_file=$REPORT" >> "$GITHUB_OUTPUT"
+          else
+            echo "modified=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post, update, or delete PR comment
+        uses: actions/github-script@v7
+        env:
+          MODIFIED: ${{ steps.diff.outputs.modified }}
+          REPORT_FILE: ${{ steps.diff.outputs.report_file }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- test-modification-detector -->';
+            const modified = process.env.MODIFIED === 'true';
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+
+            if (modified) {
+              const report = fs.readFileSync(process.env.REPORT_FILE, 'utf8');
+              const baseRef = process.env.BASE_REF;
+              const body = [
+                marker,
+                '## :warning: Existing tests were modified',
+                '',
+                `The following test files have removed or changed lines compared to \`${baseRef}\`:`,
+                '',
+                report.trimEnd(),
+                '',
+                'Adding new tests is fine and does not trigger this notice. This appears when existing test code (or helpers under `tests/common/`) is edited or removed. That can be legitimate — but every change should be deliberate and visible to reviewers.',
+              ].join('\n');
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body,
+                });
+              }
+            } else if (existing) {
+              // Modifications were rolled back in a later push; clear the notice.
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+              });
+            }
