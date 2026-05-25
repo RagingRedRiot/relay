@@ -397,6 +397,34 @@ async fn process_message(
                             }
                         }
                     }
+
+                    ClientCommand::Promote { target_username } => {
+                        match handles.user_handle.promote(user_id, &target_username).await {
+                            UserResponse::Success => {
+                                let _ = user_tx.send(ServerEvent::Success).await;
+                            }
+                            UserResponse::NoChange => {
+                                let _ = user_tx.send(ServerEvent::NoChange).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+
+                    ClientCommand::Demote { target_username } => {
+                        match handles.user_handle.demote(user_id, &target_username).await {
+                            UserResponse::Success => {
+                                let _ = user_tx.send(ServerEvent::Success).await;
+                            }
+                            UserResponse::NoChange => {
+                                let _ = user_tx.send(ServerEvent::NoChange).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
                 },
                 Err(e) => {
                     println!("ERR: {:?}", e);

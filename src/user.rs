@@ -30,6 +30,16 @@ pub enum UserRequest {
         user_id: Uuid,
         tx: oneshot::Sender<UserResponse>,
     },
+    Promote {
+        source_user_id: Uuid,
+        target_username: String,
+        tx: oneshot::Sender<UserResponse>,
+    },
+    Demote {
+        source_user_id: Uuid,
+        target_username: String,
+        tx: oneshot::Sender<UserResponse>,
+    },
     EditUserRequest {
         source_user_id: Uuid,
         target_username: String,
@@ -64,6 +74,7 @@ pub enum UserResponse {
     UserInfo { user_info: User },
     IsAdmin { is_admin: bool },
     UserDeleted { is_self: bool },
+    NoChange,
     NoUserExists,
     Success,
     Failed,
@@ -221,6 +232,44 @@ impl UserHandle {
                 source_user_id,
                 target_username,
                 new_password,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return UserResponse::Failed;
+        }
+
+        rx.await.unwrap_or(UserResponse::Failed)
+    }
+
+    pub async fn promote(&self, source_user_id: Uuid, target_username: &str) -> UserResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(UserRequest::Promote {
+                source_user_id,
+                target_username: target_username.to_string(),
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return UserResponse::Failed;
+        }
+
+        rx.await.unwrap_or(UserResponse::Failed)
+    }
+
+    pub async fn demote(&self, source_user_id: Uuid, target_username: &str) -> UserResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(UserRequest::Demote {
+                source_user_id,
+                target_username: target_username.to_string(),
                 tx,
             })
             .await
@@ -411,20 +460,14 @@ async fn handle_request(
             };
 
             // Translate Username into UserID
-            let user_response = match get_user_by_username(&mut db, &target_username).await {
-                Ok(res) => res,
-                Err(_e) => {
-                    // TODO - Logging
-                    return (UserResponse::Failed, tx);
-                }
-            };
-            let user_id: Uuid = match user_response {
-                UserResponse::UserInfo { user_info } => user_info.user_id,
-                _ => {
-                    // TODO - Logging
-                    return (UserResponse::Failed, tx);
-                }
-            };
+            let target_user_id: Uuid =
+                match translate_username_to_id(&mut db, &target_username).await {
+                    Ok(maybe_user_id) => match maybe_user_id {
+                        Some(user_id) => user_id,
+                        None => return (UserResponse::Failed, tx),
+                    },
+                    Err(_) => return (UserResponse::Failed, tx),
+                };
 
             // Check if source user is admin
             let is_admin: bool = match is_admin(&mut db, source_user_id).await {
@@ -436,13 +479,13 @@ async fn handle_request(
             };
 
             // If the user source is not an admin or targeting itself, fail
-            if !is_admin && user_id != source_user_id {
+            if !is_admin && target_user_id != source_user_id {
                 // TODO - Logging
                 return (UserResponse::Failed, tx);
             }
 
             // Check if the target user is Default Admin
-            let maybe_admin: Option<Admin> = match get_admin(&mut db, user_id).await {
+            let maybe_admin: Option<Admin> = match get_admin(&mut db, target_user_id).await {
                 Ok(maybe_admin) => maybe_admin,
                 Err(_) => {
                     // TODO - Logging
@@ -458,9 +501,19 @@ async fn handle_request(
                 return (UserResponse::Failed, tx); // Don't allow default admin to be deleted, even by admin or itself
             }
 
-            let success = delete_user(&mut db, user_id).await;
+            let success = match sqlx::query("DELETE FROM users WHERE user_id = $1")
+                .bind(target_user_id)
+                .execute(&mut *db)
+                .await
+            {
+                Ok(res) => res.rows_affected() == 1,
+                Err(_e) => {
+                    // TODO - Logging
+                    false
+                }
+            };
 
-            if source_user_id == user_id && success {
+            if source_user_id == target_user_id && success {
                 (UserResponse::UserDeleted { is_self: true }, tx)
             } else if success {
                 (UserResponse::UserDeleted { is_self: false }, tx)
@@ -575,20 +628,14 @@ async fn handle_request(
             }
 
             // Translate Username into UserID
-            let user_response = match get_user_by_username(&mut db, &target_username).await {
-                Ok(res) => res,
-                Err(_e) => {
-                    // TODO - Logging
-                    return (UserResponse::Failed, tx);
-                }
-            };
-            let target_user_id: Uuid = match user_response {
-                UserResponse::UserInfo { user_info } => user_info.user_id,
-                _ => {
-                    // TODO - Logging
-                    return (UserResponse::Failed, tx);
-                }
-            };
+            let target_user_id: Uuid =
+                match translate_username_to_id(&mut db, &target_username).await {
+                    Ok(maybe_user_id) => match maybe_user_id {
+                        Some(user_id) => user_id,
+                        None => return (UserResponse::Failed, tx),
+                    },
+                    Err(_) => return (UserResponse::Failed, tx),
+                };
 
             // Admins can change other user passwords, but not their own
             if target_user_id == source_user_id {
@@ -645,6 +692,140 @@ async fn handle_request(
                 (UserResponse::Success, tx)
             } else {
                 // TODO - Logging
+                (UserResponse::Failed, tx)
+            }
+        }
+
+        UserRequest::Promote {
+            source_user_id,
+            target_username,
+            tx,
+        } => {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            };
+
+            let source_is_admin = match is_admin(&mut db, source_user_id).await {
+                Ok(is_admin) => is_admin,
+                Err(_) => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            };
+
+            if !source_is_admin {
+                return (UserResponse::Failed, tx);
+            }
+
+            // Translate Username into UserID
+            let target_user_id: Uuid =
+                match translate_username_to_id(&mut db, &target_username).await {
+                    Ok(maybe_user_id) => match maybe_user_id {
+                        Some(user_id) => user_id,
+                        None => return (UserResponse::Failed, tx),
+                    },
+                    Err(_) => return (UserResponse::Failed, tx),
+                };
+
+            let result = match sqlx::query(
+                "INSERT INTO admins (user_id, granted_by) \
+                VALUES ($1, $2) \
+                ON CONFLICT DO NOTHING",
+            )
+            .bind(target_user_id)
+            .bind(source_user_id)
+            .execute(&mut *db)
+            .await
+            {
+                Ok(res) => res,
+                Err(_) => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            };
+
+            match result.rows_affected() {
+                1 => (UserResponse::Success, tx),
+                0 => (UserResponse::NoChange, tx),
+                _ => unreachable!(),
+            }
+        }
+
+        UserRequest::Demote {
+            source_user_id,
+            target_username,
+            tx,
+        } => {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            };
+
+            let source_is_admin = match is_admin(&mut db, source_user_id).await {
+                Ok(is_admin) => is_admin,
+                Err(_) => {
+                    // TODO - Logging
+                    return (UserResponse::Failed, tx);
+                }
+            };
+
+            if !source_is_admin {
+                return (UserResponse::Failed, tx);
+            }
+
+            // Translate Username into UserID
+            let target_user_id: Uuid =
+                match translate_username_to_id(&mut db, &target_username).await {
+                    Ok(maybe_user_id) => match maybe_user_id {
+                        Some(user_id) => user_id,
+                        None => return (UserResponse::Failed, tx),
+                    },
+                    Err(_) => return (UserResponse::Failed, tx),
+                };
+
+            let (target_is_admin, target_is_default) =
+                match get_admin(&mut db, target_user_id).await {
+                    Ok(maybe_admin) => match maybe_admin {
+                        Some(admin) => (true, admin.is_default),
+                        None => (false, false),
+                    },
+                    Err(_) => {
+                        // TODO - Logging
+                        return (UserResponse::Failed, tx);
+                    }
+                };
+
+            // If the target is not an admin, no need to perform additional db activity
+            if !target_is_admin {
+                return (UserResponse::NoChange, tx);
+            }
+            // Reject attempts to demote the default admin
+            if target_is_default {
+                return (UserResponse::Failed, tx);
+            }
+
+            let success = match sqlx::query("DELETE FROM admins WHERE user_id = $1")
+                .bind(target_user_id)
+                .execute(&mut *db)
+                .await
+            {
+                Ok(res) => res.rows_affected() == 1,
+                Err(_e) => {
+                    // TODO - Logging
+                    false
+                }
+            };
+
+            if success {
+                (UserResponse::Success, tx)
+            } else {
                 (UserResponse::Failed, tx)
             }
         }
@@ -747,20 +928,6 @@ async fn edit_user(
     }
 }
 
-async fn delete_user(db: &mut PgConnection, user_id: Uuid) -> bool {
-    match sqlx::query("DELETE FROM users WHERE user_id = $1")
-        .bind(user_id)
-        .execute(db)
-        .await
-    {
-        Ok(res) => res.rows_affected() == 1,
-        Err(_e) => {
-            // TODO - Logging
-            false
-        }
-    }
-}
-
 async fn get_user_by_username(
     db: &mut PgConnection,
     username: &str,
@@ -818,6 +985,20 @@ async fn update_admin(
     .await?;
 
     Ok(())
+}
+
+async fn translate_username_to_id(
+    db: &mut PgConnection,
+    username: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let user_response = get_user_by_username(db, username).await?;
+    match user_response {
+        UserResponse::UserInfo { user_info } => Ok(Some(user_info.user_id)),
+        _ => {
+            // TODO - Logging
+            Ok(None)
+        }
+    }
 }
 
 async fn get_default_admin(db: &mut PgConnection) -> Result<Option<Admin>, sqlx::Error> {

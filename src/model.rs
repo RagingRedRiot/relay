@@ -37,6 +37,12 @@ pub enum ClientCommand {
         last_name: Option<String>,
         alias: Option<String>,
     },
+    Promote {
+        target_username: String,
+    },
+    Demote {
+        target_username: String,
+    },
     DeleteUser {
         target_username: String,
     },
@@ -86,6 +92,7 @@ pub enum ServerEvent {
         username: String,
         created_at: DateTime<Utc>,
     },
+    NoChange,
     NoUserExists,
     Success,
     Failed,
