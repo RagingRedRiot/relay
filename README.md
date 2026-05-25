@@ -2,7 +2,7 @@
 
 A self-hosted real-time chat platform written in async Rust.
 
-> **Status:** Early development. POC stage — interfaces will change. Not production ready.
+> **Status:** Early development — interfaces will change as rooms and messaging are added. Not production ready.
 
 ## Overview
 
