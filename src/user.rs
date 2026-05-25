@@ -1,4 +1,7 @@
-use argon2::{Argon2, PasswordHash, PasswordVerifier};
+use argon2::{
+    Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
+    password_hash::{SaltString, rand_core::OsRng},
+};
 use sqlx::{PgConnection, PgPool, Row, postgres::PgRow};
 use tokio::{
     select,
@@ -7,10 +10,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{
-    actor::generate_hash,
-    model::{self, Admin, EditUser, NewCredential, NewUser, Password, User},
-};
+use crate::model::{self, Admin, EditUser, NewCredential, NewUser, Password, User};
 
 pub enum UserRequest {
     NewUserRequest {
@@ -1075,4 +1075,12 @@ async fn verify_password(db: &mut PgConnection, user_id: Uuid, password: Passwor
         }
         None => false,
     }
+}
+
+fn generate_hash(credential: NewCredential) -> Result<String, argon2::password_hash::Error> {
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = Argon2::default()
+        .hash_password(credential.password.0.as_bytes(), &salt)?
+        .to_string();
+    Ok(hash)
 }

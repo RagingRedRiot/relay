@@ -1,8 +1,8 @@
-use std::net::SocketAddr;
 use relay::auth;
 use relay::model::{NewCredential, Password};
 use relay::user::ensure_admin;
 use sqlx::PgPool;
+use std::net::SocketAddr;
 use tokio_util::sync::CancellationToken;
 
 use relay::app::app;
@@ -17,26 +17,26 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let shutdown = CancellationToken::new();
-    
+
     let pool = PgPool::connect(&config.database_url).await.unwrap();
     sqlx::migrate!("./migrations")
-      .run(&pool)
-      .await
-      .expect("database migrations failed");
+        .run(&pool)
+        .await
+        .expect("database migrations failed");
 
     ensure_admin(
         pool.clone(),
         &config.admin_username,
-        NewCredential{
-            password: Password(config.admin_credential.to_owned())
-        }
+        NewCredential {
+            password: Password(config.admin_credential.to_owned()),
+        },
     )
-      .await
-      .expect("failed to ensure default admin");
+    .await
+    .expect("failed to ensure default admin");
 
     let auth_handle = auth::spawn(shutdown.clone(), pool.clone()).await;
     let listener = tokio::net::TcpListener::bind(&config.bind).await.unwrap();
-    
+
     let app = app(shutdown.clone(), auth_handle, config, pool.clone()).await;
 
     tokio::spawn({
