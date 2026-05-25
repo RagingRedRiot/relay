@@ -50,6 +50,8 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      ADMIN_USERNAME: admin
+      ADMIN_CREDENTIAL: ci-test-password
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
