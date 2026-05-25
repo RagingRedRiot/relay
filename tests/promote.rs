@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 // ##### Happy path #####
 
-// Admin promotes a regular user: protocol returns Success, and the new
+// Admin promotes a non-admin user: protocol returns Success, and the new
 // admins row records the granting admin's user_id and is_default = false.
 #[sqlx::test]
 async fn admin_promotes_user(pool: PgPool) {
