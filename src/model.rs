@@ -214,7 +214,8 @@ pub struct NewMessage {
 pub struct Message {
     pub message_id: Uuid,
     pub room_id: Uuid,
-    pub sender_id: Uuid,
+    pub sender_id: Option<Uuid>,
+    pub sender_username_snapshot: Option<String>,
     pub content: String,
     pub timestamp: DateTime<Utc>,
 }

@@ -40,11 +40,13 @@ CREATE TABLE memberships (
 );
 
 CREATE TABLE messages (
-    message_id  UUID         PRIMARY KEY DEFAULT uuidv7(),
-    room_id     UUID         NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
-    sender_id   UUID         NOT NULL REFERENCES users(user_id),
-    content     TEXT         NOT NULL,
-    timestamp   TIMESTAMPTZ  NOT NULL DEFAULT now()
+    message_id               UUID         PRIMARY KEY DEFAULT uuidv7(),
+    room_id                  UUID         NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
+    sender_id                UUID         REFERENCES users(user_id) ON DELETE SET NULL,
+    sender_username_snapshot TEXT,
+    content                  TEXT         NOT NULL,
+    timestamp                TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    CHECK (sender_id IS NOT NULL OR sender_username_snapshot IS NOT NULL)
 );
 
 CREATE INDEX messages_room_timestamp ON messages (room_id, timestamp DESC);

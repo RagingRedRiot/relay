@@ -451,7 +451,7 @@ async fn handle_request(
             source_user_id,
             tx,
         } => {
-            let mut db = match pool.acquire().await {
+            let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
                 Ok(db) => db,
                 Err(_e) => {
                     // TODO - Logging
@@ -501,6 +501,38 @@ async fn handle_request(
                 return (UserResponse::Failed, tx); // Don't allow default admin to be deleted, even by admin or itself
             }
 
+            // Put a DB lock on the target user's ID
+            if let Err(_e) = sqlx::query("SELECT user_id FROM users WHERE user_id = $1 FOR UPDATE")
+                .bind(target_user_id)
+                .execute(&mut *db)
+                .await
+            {
+                // TODO - Logging
+                return (UserResponse::Failed, tx);
+            }
+
+            if let Err(_e) = sqlx::query(
+                "UPDATE messages set sender_username_snapshot = u.username
+                FROM users u
+                WHERE messages.sender_id = $1 AND u.user_id = $1",
+            )
+            .bind(target_user_id)
+            .execute(&mut *db)
+            .await
+            {
+                // TODO - Logging
+                return (UserResponse::Failed, tx);
+            };
+
+            if let Err(_e) = sqlx::query("UPDATE rooms SET owner_id = (SELECT user_id FROM admins WHERE is_default = true) WHERE owner_id = $1")
+                .bind(target_user_id)
+                .execute(&mut *db)
+                .await
+            {
+                // TODO - Logging
+                return (UserResponse::Failed, tx);
+            };
+
             let success = match sqlx::query("DELETE FROM users WHERE user_id = $1")
                 .bind(target_user_id)
                 .execute(&mut *db)
@@ -513,13 +545,16 @@ async fn handle_request(
                 }
             };
 
-            if source_user_id == target_user_id && success {
-                (UserResponse::UserDeleted { is_self: true }, tx)
-            } else if success {
-                (UserResponse::UserDeleted { is_self: false }, tx)
-            } else {
-                (UserResponse::Failed, tx)
+            if !success {
+                return (UserResponse::Failed, tx);
             }
+            if let Err(_e) = db.commit().await {
+                // TODO - Logging
+                return (UserResponse::Failed, tx);
+            }
+            let is_self = source_user_id == target_user_id;
+
+            (UserResponse::UserDeleted { is_self }, tx)
         }
 
         UserRequest::UpdatePassword {
