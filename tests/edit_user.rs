@@ -295,10 +295,9 @@ async fn edit_with_no_changes_succeeds(pool: PgPool) {
     close_socket(&mut ws).await;
 }
 
-// Empty strings are distinct from None: the actor does not normalize "" to
-// NULL today, so they overwrite the existing value. This test locks in
-// that behavior — if we later add validation that rejects "" on these
-// fields, this assertion will be the canary.
+// Empty strings are distinct from None on edit: None leaves a field
+// untouched, while an explicit "" (or whitespace-only) clears it to NULL.
+// This test locks in that clearing behavior.
 #[sqlx::test]
 async fn empty_string_fields_overwrite_existing_values(pool: PgPool) {
     seed_user(&pool, "bob", "bobpw").await;
@@ -336,9 +335,9 @@ async fn empty_string_fields_overwrite_existing_values(pool: PgPool) {
     assert_eq!(
         fetch_user_info(&mut ws, "bob").await,
         UserInfoFields {
-            first_name: Some(String::new()),
-            last_name: Some(String::new()),
-            alias: Some(String::new()),
+            first_name: None,
+            last_name: None,
+            alias: None,
             username: "bob".to_owned(),
         }
     );

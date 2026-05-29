@@ -63,7 +63,7 @@ async fn authenticate(
         "SELECT u.user_id, c.password_hash
         FROM users u
         JOIN credentials c USING (user_id)
-        WHERE u.username = $1",
+        WHERE LOWER(u.username) = LOWER(trim_ws($1))",
     )
     .bind(&username)
     .fetch_optional(&pool)
@@ -137,7 +137,6 @@ pub async fn spawn(shutdown: CancellationToken, pool: PgPool) -> AuthHandle {
         loop {
             select! {
                 req = rx.recv() => {
-                    // All handles dropped — no more requests will arrive.
                     let Some(req) = req else { break };
                     let result = authenticate(req.username, req.password, Arc::clone(&dummy_hash), pool.clone()).await;
                     let _ = req.tx.send(result);
