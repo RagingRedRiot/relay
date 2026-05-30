@@ -295,7 +295,6 @@ pub async fn spawn(shutdown: CancellationToken, pool: PgPool) -> UserHandle {
         loop {
             select! {
                 req = rx.recv() => {
-                    // All handles dropped — no more requests will arrive.
                     let Some(req) = req else { break };
                     let (result, req_tx) = handle_request(req, pool.clone()).await;
                     let _ = req_tx.send(result);
@@ -872,7 +871,7 @@ async fn create_user(
     user: NewUser,
     password_hash: &str,
 ) -> Result<Uuid, sqlx::Error> {
-    let user_id: Uuid = sqlx::query("INSERT INTO users (username, first_name, last_name, alias) VALUES ($1, $2, $3, $4) RETURNING user_id")
+    let user_id: Uuid = sqlx::query("INSERT INTO users (username, first_name, last_name, alias) VALUES (trim_ws($1), NULLIF(trim_ws($2), ''), NULLIF(trim_ws($3), ''), NULLIF(trim_ws($4), '')) RETURNING user_id")
         .bind(user.username)
         .bind(user.first_name)
         .bind(user.last_name)
@@ -897,7 +896,7 @@ async fn edit_user(
 ) -> Result<UserResponse, sqlx::Error> {
     let row: PgRow = sqlx::query(
         "SELECT
-      (SELECT user_id FROM users WHERE username = $1) AS target_id,
+      (SELECT user_id FROM users WHERE LOWER(username) = LOWER(trim_ws($1))) AS target_id,
       EXISTS (SELECT 1 FROM admins WHERE user_id = $2) AS is_admin",
     )
     .bind(target_username)
@@ -939,10 +938,10 @@ async fn edit_user(
 
     let result = sqlx::query(
         "UPDATE users
-        SET first_name = COALESCE($1, first_name),
-            last_name  = COALESCE($2, last_name),
-            alias      = COALESCE($3, alias),
-            username   = COALESCE($4, username)
+        SET first_name = CASE WHEN $1 IS NULL THEN first_name ELSE NULLIF(trim_ws($1), '') END,
+            last_name  = CASE WHEN $2 IS NULL THEN last_name  ELSE NULLIF(trim_ws($2), '') END,
+            alias      = CASE WHEN $3 IS NULL THEN alias       ELSE NULLIF(trim_ws($3), '') END,
+            username   = COALESCE(NULLIF(trim_ws($4), ''), username)
         WHERE user_id = $5",
     )
     .bind(edit.first_name)
@@ -968,7 +967,7 @@ async fn get_user_by_username(
     username: &str,
 ) -> Result<UserResponse, sqlx::Error> {
     let row: Option<User> = sqlx::query_as::<_, User> (
-        "SELECT first_name, last_name, alias, username, user_id, created_at FROM users WHERE username = $1"
+        "SELECT first_name, last_name, alias, username, user_id, created_at FROM users WHERE LOWER(username) = LOWER(trim_ws($1))"
     ).bind(username)
     .fetch_optional(db)
     .await?;
@@ -1005,7 +1004,7 @@ async fn update_admin(
     username: &str,
     password_hash: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE users SET username = $1 WHERE user_id = $2")
+    sqlx::query("UPDATE users SET username = trim_ws($1) WHERE user_id = $2")
         .bind(username)
         .bind(user_id)
         .execute(&mut *db)
