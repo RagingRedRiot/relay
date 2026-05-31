@@ -54,6 +54,56 @@ pub enum ClientCommand {
         target_username: String,
         new_password: Password,
     },
+    NewRoom {
+        room_name: String,
+        is_public: Option<bool>,
+        is_discoverable: Option<bool>,
+    },
+    AddRoomOwner {
+        room_name: String,
+        new_owner_username: String,
+    },
+    SetRoomName {
+        current_name: String,
+        new_name: String,
+    },
+    GetRoomMembership {
+        room_name: String,
+    },
+    GetRoom {
+        room_name: String,
+    },
+    JoinRoom {
+        room_name: String,
+    },
+    LeaveRoom {
+        room_name: String,
+    },
+    // The caller's own outstanding join requests.
+    GetMyJoinRequests,
+    // Pending join requests for rooms the caller owns (or any room, if admin).
+    GetIncomingJoinRequests,
+    ApproveJoinRequest {
+        room_name: String,
+        requester_username: String,
+    },
+    RejectJoinRequest {
+        room_name: String,
+        requester_username: String,
+    },
+    // Owner/admin invites a user into a room.
+    InviteToRoom {
+        room_name: String,
+        invitee_username: String,
+    },
+    // Invitations addressed to the caller.
+    GetMyInvites,
+    AcceptInvite {
+        room_name: String,
+    },
+    DeclineInvite {
+        room_name: String,
+    },
     Close,
     Error {
         error: String,
@@ -92,8 +142,28 @@ pub enum ServerEvent {
         username: String,
         created_at: DateTime<Utc>,
     },
+    RoomMembers {
+        members: Vec<PublicUser>,
+    },
+    RoomInfo {
+        room_name: String,
+        is_public: bool,
+        is_discoverable: bool,
+    },
+    MyJoinRequests {
+        rooms: Vec<String>,
+    },
+    IncomingJoinRequests {
+        requests: Vec<JoinRequestInfo>,
+    },
+    MyInvites {
+        rooms: Vec<String>,
+    },
     NoChange,
     NoUserExists,
+    NoRoomExists,
+    RoomCreated,
+    JoinRequested,
     Success,
     Failed,
 }
@@ -137,6 +207,17 @@ pub struct User {
     pub alias: Option<String>,
     pub username: String,
     pub user_id: Uuid,
+    pub created_at: DateTime<Utc>,
+}
+
+// A user as shown to clients -- identical to User but without the internal
+// user_id, which never goes over the wire.
+#[derive(sqlx::FromRow, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PublicUser {
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub alias: Option<String>,
+    pub username: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -189,19 +270,23 @@ pub struct Credential {
 pub struct NewRoom {
     pub room_name: String,
     pub owner_id: Uuid,
+    pub is_public: bool,
+    pub is_discoverable: bool,
 }
 
 #[derive(sqlx::FromRow)]
 pub struct Room {
     pub room_name: String,
     pub room_id: Uuid,
-    pub owner_id: Uuid,
+    pub is_public: bool,
+    pub is_discoverable: bool,
 }
 
-// Joined View -- Constructed at the query level
-pub struct RoomWithOwner {
-    pub room_id: Uuid,
-    pub owner: User,
+// Joined View -- Constructed at the query level. Ownership is now multi-valued
+// (memberships.is_owner), so a room carries a set of owners rather than one.
+pub struct RoomWithOwners {
+    pub room: Room,
+    pub owners: Vec<User>,
 }
 
 pub struct NewMessage {
@@ -233,4 +318,49 @@ pub struct MessageWithUser {
 pub struct Membership {
     pub room_id: Uuid,
     pub user_id: Uuid,
+    pub is_owner: bool,
+    pub joined_at: DateTime<Utc>,
+}
+
+// Client-sourced: an owner invites `invitee_username` into `room_name`. Clients
+// don't know PKs, so the room actor resolves both names to IDs. The inviter is
+// the authenticated caller, supplied server-side rather than carried here.
+pub struct NewRoomInvite {
+    pub room_name: String,
+    pub invitee_username: String,
+}
+
+// Pending invitation: an owner invited this user into the room. Row exists only
+// while the invite is outstanding. Persisted shape -- keyed by the IDs the actor
+// resolved from NewRoomInvite.
+#[derive(sqlx::FromRow)]
+pub struct RoomInvite {
+    pub room_id: Uuid,
+    pub user_id: Uuid,
+    pub invited_by: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+// Client-sourced: the authenticated caller requests to join `room_name`. The
+// requesting user is the session user, so only the room name comes from the
+// client; the actor resolves it to a room_id.
+pub struct NewRoomJoinRequest {
+    pub room_name: String,
+}
+
+// Pending join request: this user asked to join the room. Row exists only while
+// the request is outstanding. Persisted shape -- keyed by resolved IDs.
+#[derive(sqlx::FromRow)]
+pub struct RoomJoinRequest {
+    pub room_id: Uuid,
+    pub user_id: Uuid,
+    pub created_at: DateTime<Utc>,
+}
+
+// Client-facing view of a pending join request: the room and the user who asked.
+// Names rather than IDs, so it can both come from a query and go out on the wire.
+#[derive(sqlx::FromRow, Serialize, Deserialize, PartialEq, Debug)]
+pub struct JoinRequestInfo {
+    pub room_name: String,
+    pub username: String,
 }

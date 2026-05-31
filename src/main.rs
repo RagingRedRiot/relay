@@ -3,6 +3,7 @@ use relay::model::{NewCredential, Password};
 use relay::user::ensure_admin;
 use sqlx::PgPool;
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use relay::app::app;
@@ -35,6 +36,14 @@ async fn main() {
     .expect("failed to ensure default admin");
 
     let auth_handle = auth::spawn(shutdown.clone(), pool.clone()).await;
+
+    relay::reaper::spawn(
+        shutdown.clone(),
+        pool.clone(),
+        config.retention_days,
+        Duration::from_secs(config.reap_interval_secs),
+    );
+
     let listener = tokio::net::TcpListener::bind(&config.bind).await.unwrap();
 
     let app = app(shutdown.clone(), auth_handle, config, pool.clone()).await;

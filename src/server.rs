@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::model::{EditUser, NewCredential, NewUser};
+use crate::room::RoomHandle;
 use crate::user::{UserHandle, UserResponse};
 use crate::{
     app::AppState,
@@ -19,6 +20,7 @@ use crate::{
 
 struct Handles {
     user_handle: UserHandle,
+    room_handle: RoomHandle,
 }
 
 async fn send_close(sender: &mut SplitSink<WebSocket, Message>, who: SocketAddr) {
@@ -188,6 +190,7 @@ pub(crate) async fn handle_socket(socket: WebSocket, state: AppState, who: Socke
     let open_signups: bool = state.config.open_signups;
     let handles = Handles {
         user_handle: state.user_handle.clone(),
+        room_handle: state.room_handle.clone(),
     };
 
     // TODO
@@ -238,6 +241,7 @@ async fn process_message(
                     ClientCommand::Echo { string } => {
                         user_tx.send(ServerEvent::Echo { string }).await.unwrap();
                     }
+
                     ClientCommand::Message {
                         user_id,
                         room_id,
@@ -248,9 +252,11 @@ async fn process_message(
                             user_id, room_id, value
                         )
                     }
+
                     ClientCommand::Error { .. } => {
                         // ERROR from the CLIENT
                     }
+
                     ClientCommand::NewUser {
                         username,
                         password,
@@ -286,6 +292,7 @@ async fn process_message(
                             }
                         }
                     }
+
                     ClientCommand::EditUser {
                         target_username,
                         username,
@@ -315,6 +322,7 @@ async fn process_message(
                             }
                         }
                     }
+
                     ClientCommand::GetUserByUsername { username } => {
                         match handles.user_handle.get_user_by_username(&username).await {
                             UserResponse::UserInfo { user_info } => {
@@ -337,6 +345,7 @@ async fn process_message(
                             }
                         }
                     }
+
                     ClientCommand::DeleteUser { target_username } => {
                         match handles
                             .user_handle
@@ -418,6 +427,264 @@ async fn process_message(
                                 let _ = user_tx.send(ServerEvent::Success).await;
                             }
                             UserResponse::NoChange => {
+                                let _ = user_tx.send(ServerEvent::NoChange).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+
+                    ClientCommand::NewRoom {
+                        room_name,
+                        is_public,
+                        is_discoverable,
+                    } => {
+                        match handles
+                            .room_handle
+                            .new_room(crate::model::NewRoom {
+                                room_name,
+                                owner_id: user_id,
+                                is_public: is_public.unwrap_or(false),
+                                is_discoverable: is_discoverable.unwrap_or(false),
+                            })
+                            .await
+                        {
+                            crate::room::RoomResponse::RoomCreated { .. } => {
+                                let _ = user_tx.send(ServerEvent::Success).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+
+                    ClientCommand::AddRoomOwner {
+                        room_name,
+                        new_owner_username,
+                    } => {
+                        match handles
+                            .room_handle
+                            .add_room_owner(user_id, room_name, new_owner_username)
+                            .await
+                        {
+                            crate::room::RoomResponse::Success => {
+                                let _ = user_tx.send(ServerEvent::Success).await;
+                            }
+                            crate::room::RoomResponse::NoChange => {
+                                let _ = user_tx.send(ServerEvent::NoChange).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+
+                    ClientCommand::SetRoomName {
+                        current_name,
+                        new_name,
+                    } => {
+                        match handles
+                            .room_handle
+                            .set_room_name(user_id, current_name, new_name)
+                            .await
+                        {
+                            crate::room::RoomResponse::Success => {
+                                let _ = user_tx.send(ServerEvent::Success).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+
+                    ClientCommand::GetRoomMembership { room_name } => {
+                        match handles
+                            .room_handle
+                            .get_room_members(user_id, room_name)
+                            .await
+                        {
+                            crate::room::RoomResponse::RoomMembership { members } => {
+                                let _ = user_tx.send(ServerEvent::RoomMembers { members }).await;
+                            }
+                            crate::room::RoomResponse::NoRoomExists => {
+                                let _ = user_tx.send(ServerEvent::NoRoomExists).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+                    ClientCommand::GetRoom { room_name } => {
+                        match handles.room_handle.get_room(user_id, room_name).await {
+                            crate::room::RoomResponse::RoomInfo {
+                                room_name,
+                                is_public,
+                                is_discoverable,
+                            } => {
+                                let _ = user_tx
+                                    .send(ServerEvent::RoomInfo {
+                                        room_name,
+                                        is_public,
+                                        is_discoverable,
+                                    })
+                                    .await;
+                            }
+                            crate::room::RoomResponse::NoRoomExists => {
+                                let _ = user_tx.send(ServerEvent::NoRoomExists).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+                    ClientCommand::JoinRoom { room_name } => {
+                        match handles.room_handle.join_room(user_id, room_name).await {
+                            crate::room::RoomResponse::Success => {
+                                let _ = user_tx.send(ServerEvent::Success).await;
+                            }
+                            crate::room::RoomResponse::JoinRequested => {
+                                let _ = user_tx.send(ServerEvent::JoinRequested).await;
+                            }
+                            crate::room::RoomResponse::NoChange => {
+                                let _ = user_tx.send(ServerEvent::NoChange).await;
+                            }
+                            crate::room::RoomResponse::NoRoomExists => {
+                                let _ = user_tx.send(ServerEvent::NoRoomExists).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+                    ClientCommand::LeaveRoom { room_name } => {
+                        match handles.room_handle.leave_room(user_id, room_name).await {
+                            crate::room::RoomResponse::Success => {
+                                let _ = user_tx.send(ServerEvent::Success).await;
+                            }
+                            crate::room::RoomResponse::NoChange => {
+                                let _ = user_tx.send(ServerEvent::NoChange).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+                    ClientCommand::GetMyJoinRequests => {
+                        match handles.room_handle.get_my_join_requests(user_id).await {
+                            crate::room::RoomResponse::MyJoinRequests { rooms } => {
+                                let _ = user_tx.send(ServerEvent::MyJoinRequests { rooms }).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+                    ClientCommand::GetIncomingJoinRequests => {
+                        match handles
+                            .room_handle
+                            .get_incoming_join_requests(user_id)
+                            .await
+                        {
+                            crate::room::RoomResponse::IncomingJoinRequests { requests } => {
+                                let _ = user_tx
+                                    .send(ServerEvent::IncomingJoinRequests { requests })
+                                    .await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+                    ClientCommand::ApproveJoinRequest {
+                        room_name,
+                        requester_username,
+                    } => {
+                        match handles
+                            .room_handle
+                            .approve_join_request(user_id, room_name, requester_username)
+                            .await
+                        {
+                            crate::room::RoomResponse::Success => {
+                                let _ = user_tx.send(ServerEvent::Success).await;
+                            }
+                            crate::room::RoomResponse::NoChange => {
+                                let _ = user_tx.send(ServerEvent::NoChange).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+                    ClientCommand::RejectJoinRequest {
+                        room_name,
+                        requester_username,
+                    } => {
+                        match handles
+                            .room_handle
+                            .reject_join_request(user_id, room_name, requester_username)
+                            .await
+                        {
+                            crate::room::RoomResponse::Success => {
+                                let _ = user_tx.send(ServerEvent::Success).await;
+                            }
+                            crate::room::RoomResponse::NoChange => {
+                                let _ = user_tx.send(ServerEvent::NoChange).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+                    ClientCommand::InviteToRoom {
+                        room_name,
+                        invitee_username,
+                    } => {
+                        match handles
+                            .room_handle
+                            .invite_to_room(user_id, room_name, invitee_username)
+                            .await
+                        {
+                            crate::room::RoomResponse::Success => {
+                                let _ = user_tx.send(ServerEvent::Success).await;
+                            }
+                            crate::room::RoomResponse::NoChange => {
+                                let _ = user_tx.send(ServerEvent::NoChange).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+                    ClientCommand::GetMyInvites => {
+                        match handles.room_handle.get_my_invites(user_id).await {
+                            crate::room::RoomResponse::MyInvites { rooms } => {
+                                let _ = user_tx.send(ServerEvent::MyInvites { rooms }).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+                    ClientCommand::AcceptInvite { room_name } => {
+                        match handles.room_handle.accept_invite(user_id, room_name).await {
+                            crate::room::RoomResponse::Success => {
+                                let _ = user_tx.send(ServerEvent::Success).await;
+                            }
+                            crate::room::RoomResponse::NoChange => {
+                                let _ = user_tx.send(ServerEvent::NoChange).await;
+                            }
+                            _ => {
+                                let _ = user_tx.send(ServerEvent::Failed).await;
+                            }
+                        }
+                    }
+                    ClientCommand::DeclineInvite { room_name } => {
+                        match handles.room_handle.decline_invite(user_id, room_name).await {
+                            crate::room::RoomResponse::Success => {
+                                let _ = user_tx.send(ServerEvent::Success).await;
+                            }
+                            crate::room::RoomResponse::NoChange => {
                                 let _ = user_tx.send(ServerEvent::NoChange).await;
                             }
                             _ => {

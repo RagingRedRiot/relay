@@ -12,6 +12,7 @@ use crate::{
     auth::AuthHandle,
     config::Config,
     handler::{index, no_content, ok, script, ws_handler},
+    room::{self, RoomHandle},
     user::{self, UserHandle},
 };
 
@@ -21,6 +22,7 @@ pub struct AppState {
     pub(crate) config: Arc<Config>,
     pub(crate) auth_handle: AuthHandle,
     pub(crate) user_handle: UserHandle,
+    pub(crate) room_handle: RoomHandle,
 }
 
 pub async fn app(
@@ -39,13 +41,15 @@ pub async fn app(
 
     // ACTOR SPAWN AND HANDLE
     // AuthHandle was spawned in calling function
-    let user_handle = user::spawn(shutdown.clone(), pool).await;
+    let user_handle = user::spawn(shutdown.clone(), pool.clone()).await;
+    let room_handle = room::spawn(shutdown.clone(), pool.clone()).await;
 
     let state = AppState {
         shutdown: shutdown.clone(),
         config: Arc::new(config),
         auth_handle,
         user_handle,
+        room_handle,
     };
 
     Router::new()

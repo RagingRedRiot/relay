@@ -1,0 +1,1453 @@
+use sqlx::{PgPool, Row};
+use tokio::select;
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+use crate::model::{self, JoinRequestInfo, PublicUser, Room};
+
+pub enum RoomRequest {
+    NewRoomRequest {
+        room_name: String,
+        source_user_id: Uuid,
+        is_public: bool,
+        is_discoverable: bool,
+        tx: oneshot::Sender<RoomResponse>,
+    },
+    AddRoomOwner {
+        source_user_id: Uuid,
+        room_name: String,
+        new_owner_username: String,
+        tx: oneshot::Sender<RoomResponse>,
+    },
+    SetRoomName {
+        source_user_id: Uuid,
+        current_name: String,
+        new_name: String,
+        tx: oneshot::Sender<RoomResponse>,
+    },
+    GetRoomMembershipByName {
+        source_user_id: Uuid,
+        room_name: String,
+        tx: oneshot::Sender<RoomResponse>,
+    },
+    GetRoomByName {
+        source_user_id: Uuid,
+        room_name: String,
+        tx: oneshot::Sender<RoomResponse>,
+    },
+    NewRoomMembershipRequest {
+        user_id: Uuid,
+        room_name: String,
+        tx: oneshot::Sender<RoomResponse>,
+    },
+    RemoveRoomMembershipRequest {
+        user_id: Uuid,
+        room_name: String,
+        tx: oneshot::Sender<RoomResponse>,
+    },
+    GetMyJoinRequests {
+        source_user_id: Uuid,
+        tx: oneshot::Sender<RoomResponse>,
+    },
+    GetIncomingJoinRequests {
+        source_user_id: Uuid,
+        tx: oneshot::Sender<RoomResponse>,
+    },
+    ApproveJoinRequest {
+        source_user_id: Uuid,
+        room_name: String,
+        requester_username: String,
+        tx: oneshot::Sender<RoomResponse>,
+    },
+    RejectJoinRequest {
+        source_user_id: Uuid,
+        room_name: String,
+        requester_username: String,
+        tx: oneshot::Sender<RoomResponse>,
+    },
+    InviteToRoom {
+        source_user_id: Uuid,
+        room_name: String,
+        invitee_username: String,
+        tx: oneshot::Sender<RoomResponse>,
+    },
+    GetMyInvites {
+        source_user_id: Uuid,
+        tx: oneshot::Sender<RoomResponse>,
+    },
+    AcceptInvite {
+        user_id: Uuid,
+        room_name: String,
+        tx: oneshot::Sender<RoomResponse>,
+    },
+    DeclineInvite {
+        user_id: Uuid,
+        room_name: String,
+        tx: oneshot::Sender<RoomResponse>,
+    },
+}
+
+pub enum RoomResponse {
+    RoomCreated {
+        room_id: Uuid,
+    },
+    RoomInfo {
+        room_name: String,
+        is_public: bool,
+        is_discoverable: bool,
+    },
+    RoomMembership {
+        members: Vec<PublicUser>,
+    },
+    MyJoinRequests {
+        rooms: Vec<String>,
+    },
+    IncomingJoinRequests {
+        requests: Vec<JoinRequestInfo>,
+    },
+    MyInvites {
+        rooms: Vec<String>,
+    },
+    NoRoomExists,
+    JoinRequested,
+    Success,
+    NoChange,
+    Failed,
+}
+
+#[derive(Clone)]
+pub struct RoomHandle {
+    sender: mpsc::Sender<RoomRequest>,
+}
+
+impl RoomHandle {
+    pub async fn new_room(&self, new_room: model::NewRoom) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::NewRoomRequest {
+                room_name: new_room.room_name,
+                source_user_id: new_room.owner_id,
+                is_public: new_room.is_public,
+                is_discoverable: new_room.is_discoverable,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
+    pub async fn add_room_owner(
+        &self,
+        source_user_id: Uuid,
+        room_name: String,
+        new_owner_username: String,
+    ) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::AddRoomOwner {
+                source_user_id,
+                room_name,
+                new_owner_username,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
+    pub async fn set_room_name(
+        &self,
+        source_user_id: Uuid,
+        current_name: String,
+        new_name: String,
+    ) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::SetRoomName {
+                source_user_id,
+                current_name,
+                new_name,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
+    pub async fn get_room(&self, source_user_id: Uuid, room_name: String) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::GetRoomByName {
+                source_user_id,
+                room_name,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
+    pub async fn get_room_members(&self, source_user_id: Uuid, room_name: String) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::GetRoomMembershipByName {
+                source_user_id,
+                room_name,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
+    pub async fn join_room(&self, user_id: Uuid, room_name: String) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::NewRoomMembershipRequest {
+                user_id,
+                room_name,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
+    pub async fn leave_room(&self, user_id: Uuid, room_name: String) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::RemoveRoomMembershipRequest {
+                user_id,
+                room_name,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
+    pub async fn get_my_join_requests(&self, source_user_id: Uuid) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::GetMyJoinRequests { source_user_id, tx })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
+    pub async fn get_incoming_join_requests(&self, source_user_id: Uuid) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::GetIncomingJoinRequests { source_user_id, tx })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
+    pub async fn approve_join_request(
+        &self,
+        source_user_id: Uuid,
+        room_name: String,
+        requester_username: String,
+    ) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::ApproveJoinRequest {
+                source_user_id,
+                room_name,
+                requester_username,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
+    pub async fn reject_join_request(
+        &self,
+        source_user_id: Uuid,
+        room_name: String,
+        requester_username: String,
+    ) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::RejectJoinRequest {
+                source_user_id,
+                room_name,
+                requester_username,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
+    pub async fn invite_to_room(
+        &self,
+        source_user_id: Uuid,
+        room_name: String,
+        invitee_username: String,
+    ) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::InviteToRoom {
+                source_user_id,
+                room_name,
+                invitee_username,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
+    pub async fn get_my_invites(&self, source_user_id: Uuid) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::GetMyInvites { source_user_id, tx })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
+    pub async fn accept_invite(&self, user_id: Uuid, room_name: String) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::AcceptInvite {
+                user_id,
+                room_name,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
+    pub async fn decline_invite(&self, user_id: Uuid, room_name: String) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::DeclineInvite {
+                user_id,
+                room_name,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+}
+
+pub async fn spawn(shutdown: CancellationToken, pool: PgPool) -> RoomHandle {
+    // ROOM ACTOR COMMUNICATION CHANNELS
+    // rx stays in the spawned actor
+    // tx gets returned in RoomHandle
+    // Cloning user handle allows a new
+    // communication channel to the actor
+    let (tx, mut rx) = mpsc::channel::<RoomRequest>(100);
+
+    // ROOM ACTOR TASK
+    tokio::spawn(async move {
+        loop {
+            select! {
+                req = rx.recv() => {
+                    let Some(req) = req else { break };
+                    let (result, req_tx) = handle_request(req, pool.clone()).await;
+                    let _ = req_tx.send(result);
+                }
+                _ = shutdown.cancelled() => {
+                    break
+                }
+            }
+        }
+    });
+
+    // ROOM ACTOR HANDLE
+    RoomHandle { sender: tx }
+}
+
+async fn handle_request(
+    req: RoomRequest,
+    pool: PgPool,
+) -> (RoomResponse, oneshot::Sender<RoomResponse>) {
+    match req {
+        RoomRequest::NewRoomRequest {
+            room_name,
+            source_user_id,
+            is_public,
+            is_discoverable,
+            tx,
+        } => {
+            let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Create the room with the requested visibility
+            let room_id: Uuid = match sqlx::query(
+                "INSERT INTO rooms (room_name, is_public, is_discoverable)
+                    VALUES (trim_ws($1), $2, $3)
+                    RETURNING room_id",
+            )
+            .bind(room_name)
+            .bind(is_public)
+            .bind(is_discoverable)
+            .fetch_optional(&mut *db)
+            .await
+            {
+                Ok(Some(row)) => match row.try_get("room_id") {
+                    Ok(room_id) => room_id,
+                    Err(_e) => {
+                        // TODO - Logging
+                        return (RoomResponse::Failed, tx);
+                    }
+                },
+                Ok(None) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Seed the creator as the room's first member and owner
+            if let Err(_e) = sqlx::query(
+                "INSERT INTO memberships (room_id, user_id, is_owner) VALUES ($1, $2, true)",
+            )
+            .bind(room_id)
+            .bind(source_user_id)
+            .execute(&mut *db)
+            .await
+            {
+                // TODO - Logging
+                return (RoomResponse::Failed, tx);
+            }
+
+            match db.commit().await {
+                Ok(_) => (RoomResponse::RoomCreated { room_id }, tx),
+                Err(_e) => {
+                    // TODO - Logging
+                    (RoomResponse::Failed, tx)
+                }
+            }
+        }
+
+        RoomRequest::AddRoomOwner {
+            source_user_id,
+            room_name,
+            new_owner_username,
+            tx,
+        } => {
+            let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Authorize: caller must own the room (or be an admin). "No such
+            // room" and "not authorized" both return Failed so existence isn't
+            // leaked.
+            let (room_id, authorized) = match gate_room(&mut db, source_user_id, &room_name).await {
+                Ok(Some(gate)) => gate,
+                Ok(None) | Err(_) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            if !authorized {
+                return (RoomResponse::Failed, tx);
+            }
+
+            // Translate the targeted user into a User ID
+            let row = match sqlx::query(
+                "SELECT user_id FROM users WHERE LOWER(username) = LOWER(trim_ws($1))",
+            )
+            .bind(new_owner_username)
+            .fetch_optional(&mut *db)
+            .await
+            {
+                Ok(maybe_user_id) => match maybe_user_id {
+                    Some(row) => row,
+                    None => {
+                        // TODO - Logging
+                        return (RoomResponse::Failed, tx);
+                    }
+                },
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            let maybe_user_id: Result<Uuid, sqlx::Error> = row.try_get("user_id");
+
+            let user_id = match maybe_user_id {
+                Ok(user_id) => user_id,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Read the targeted user's current ownership, locking the membership
+            // row so the grant below is atomic with this check.
+            //   None        -> not a member of the room  (Failed)
+            //   Some(true)  -> already an owner          (NoChange)
+            //   Some(false) -> member, not yet an owner  (grant -> Success)
+            let already_owner: Option<bool> = match sqlx::query_scalar(
+                "SELECT is_owner FROM memberships
+                    WHERE room_id = $1 AND user_id = $2
+                    FOR UPDATE",
+            )
+            .bind(room_id)
+            .bind(user_id)
+            .fetch_optional(&mut *db)
+            .await
+            {
+                Ok(maybe) => maybe,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            match already_owner {
+                None => {
+                    // Targeted user is not a member of the room
+                    // TODO - Logging
+                    (RoomResponse::Failed, tx)
+                }
+                Some(true) => {
+                    // Already an owner
+                    (RoomResponse::NoChange, tx)
+                }
+                Some(false) => {
+                    // Member but not yet an owner
+                    if let Err(_e) = sqlx::query(
+                        "UPDATE memberships SET is_owner = true
+                            WHERE room_id = $1 AND user_id = $2",
+                    )
+                    .bind(room_id)
+                    .bind(user_id)
+                    .execute(&mut *db)
+                    .await
+                    {
+                        // TODO - Logging
+                        return (RoomResponse::Failed, tx);
+                    }
+
+                    match db.commit().await {
+                        Ok(_) => (RoomResponse::Success, tx),
+                        Err(_e) => {
+                            // TODO - Logging
+                            (RoomResponse::Failed, tx)
+                        }
+                    }
+                }
+            }
+        }
+
+        RoomRequest::SetRoomName {
+            source_user_id,
+            current_name,
+            new_name,
+            tx,
+        } => {
+            let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Authorize: caller must own the room (or be an admin). "No such
+            // room" and "not authorized" both return Failed so existence isn't
+            // leaked.
+            let (room_id, authorized) =
+                match gate_room(&mut db, source_user_id, &current_name).await {
+                    Ok(Some(gate)) => gate,
+                    Ok(None) | Err(_) => {
+                        // TODO - Logging
+                        return (RoomResponse::Failed, tx);
+                    }
+                };
+
+            if !authorized {
+                return (RoomResponse::Failed, tx);
+            }
+
+            // Update the room's name to the new name
+            let result =
+                match sqlx::query("UPDATE rooms SET room_name = trim_ws($1) WHERE room_id = $2")
+                    .bind(new_name)
+                    .bind(room_id)
+                    .execute(&mut *db)
+                    .await
+                {
+                    Ok(res) => res,
+                    Err(_e) => {
+                        // TODO - Logging
+                        return (RoomResponse::Failed, tx);
+                    }
+                };
+
+            match result.rows_affected() {
+                1 => match db.commit().await {
+                    Ok(_) => (RoomResponse::Success, tx),
+                    Err(_e) => {
+                        // TODO - Logging
+                        (RoomResponse::Failed, tx)
+                    }
+                },
+                0 => (RoomResponse::Failed, tx),
+                _ => unreachable!(),
+            }
+        }
+
+        RoomRequest::GetRoomByName {
+            source_user_id,
+            room_name,
+            tx,
+        } => {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            let maybe_room = match sqlx::query_as::<_, Room>(
+                "SELECT room_name, room_id, is_public, is_discoverable
+                    FROM rooms WHERE LOWER(room_name) = LOWER(trim_ws($1))",
+            )
+            .bind(room_name)
+            .fetch_optional(&mut *db)
+            .await
+            {
+                Ok(maybe_room) => maybe_room,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            let Some(room) = maybe_room else {
+                return (RoomResponse::NoRoomExists, tx);
+            };
+
+            // Public rooms are visible to anyone. A private room is visible only
+            // to its members (owners included) and to admins; to everyone else it
+            // is reported as non-existent so its existence isn't leaked.
+            if !room.is_public {
+                let visible: bool = match sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM memberships m
+                                    WHERE m.room_id = $1 AND m.user_id = $2)
+                         OR EXISTS (SELECT 1 FROM admins a WHERE a.user_id = $2)",
+                )
+                .bind(room.room_id)
+                .bind(source_user_id)
+                .fetch_one(&mut *db)
+                .await
+                {
+                    Ok(visible) => visible,
+                    Err(_e) => {
+                        // TODO - Logging
+                        return (RoomResponse::Failed, tx);
+                    }
+                };
+
+                if !visible {
+                    return (RoomResponse::NoRoomExists, tx);
+                }
+            }
+
+            (
+                RoomResponse::RoomInfo {
+                    room_name: room.room_name,
+                    is_public: room.is_public,
+                    is_discoverable: room.is_discoverable,
+                },
+                tx,
+            )
+        }
+
+        RoomRequest::GetRoomMembershipByName {
+            source_user_id,
+            room_name,
+            tx,
+        } => {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Resolve the room and its visibility first, so a private room is
+            // hidden from non-members rather than leaking its member list.
+            let maybe_room = match sqlx::query_as::<_, Room>(
+                "SELECT room_name, room_id, is_public, is_discoverable
+                    FROM rooms WHERE LOWER(room_name) = LOWER(trim_ws($1))",
+            )
+            .bind(room_name)
+            .fetch_optional(&mut *db)
+            .await
+            {
+                Ok(maybe_room) => maybe_room,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            let Some(room) = maybe_room else {
+                return (RoomResponse::NoRoomExists, tx);
+            };
+
+            // Public rooms' membership is listable by anyone. A private room's
+            // membership is visible only to its members (owners included) and to
+            // admins; to everyone else the room is reported as non-existent.
+            if !room.is_public {
+                let visible: bool = match sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM memberships m
+                                    WHERE m.room_id = $1 AND m.user_id = $2)
+                         OR EXISTS (SELECT 1 FROM admins a WHERE a.user_id = $2)",
+                )
+                .bind(room.room_id)
+                .bind(source_user_id)
+                .fetch_one(&mut *db)
+                .await
+                {
+                    Ok(visible) => visible,
+                    Err(_e) => {
+                        // TODO - Logging
+                        return (RoomResponse::Failed, tx);
+                    }
+                };
+
+                if !visible {
+                    return (RoomResponse::NoRoomExists, tx);
+                }
+            }
+
+            let users = match sqlx::query_as::<_, PublicUser>(
+                "SELECT u.first_name, u.last_name, u.alias, u.username, u.created_at
+                FROM memberships m
+                JOIN users u ON u.user_id = m.user_id
+                WHERE m.room_id = $1
+                ORDER BY m.is_owner DESC, m.joined_at",
+            )
+            .bind(room.room_id)
+            .fetch_all(&mut *db)
+            .await
+            {
+                Ok(users) => users,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            (RoomResponse::RoomMembership { members: users }, tx)
+        }
+
+        RoomRequest::NewRoomMembershipRequest {
+            user_id,
+            room_name,
+            tx,
+        } => {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Resolve the room and its visibility to pick the join path.
+            let maybe_room = match sqlx::query_as::<_, Room>(
+                "SELECT room_name, room_id, is_public, is_discoverable
+                    FROM rooms WHERE LOWER(room_name) = LOWER(trim_ws($1))",
+            )
+            .bind(room_name)
+            .fetch_optional(&mut *db)
+            .await
+            {
+                Ok(maybe_room) => maybe_room,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            let Some(room) = maybe_room else {
+                return (RoomResponse::NoRoomExists, tx);
+            };
+
+            if room.is_public {
+                // Public: join immediately. ON CONFLICT DO NOTHING makes a
+                // repeat join a no-op (0 rows) rather than an error.
+                let result = match sqlx::query(
+                    "INSERT INTO memberships (room_id, user_id) VALUES ($1, $2)
+                        ON CONFLICT DO NOTHING",
+                )
+                .bind(room.room_id)
+                .bind(user_id)
+                .execute(&mut *db)
+                .await
+                {
+                    Ok(res) => res,
+                    Err(_e) => {
+                        // TODO - Logging
+                        return (RoomResponse::Failed, tx);
+                    }
+                };
+
+                match result.rows_affected() {
+                    1 => (RoomResponse::Success, tx),
+                    0 => (RoomResponse::NoChange, tx),
+                    _ => unreachable!(),
+                }
+            } else if room.is_discoverable {
+                // Private but discoverable: queue a join request. Insert only if
+                // not already a member; ON CONFLICT DO NOTHING drops a duplicate
+                // request. So 0 rows == already a member or already requested,
+                // both of which are NoChange.
+                let result = match sqlx::query(
+                    "INSERT INTO room_join_requests (room_id, user_id)
+                        SELECT $1, $2
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM memberships m
+                            WHERE m.room_id = $1 AND m.user_id = $2)
+                        ON CONFLICT DO NOTHING",
+                )
+                .bind(room.room_id)
+                .bind(user_id)
+                .execute(&mut *db)
+                .await
+                {
+                    Ok(res) => res,
+                    Err(_e) => {
+                        // TODO - Logging
+                        return (RoomResponse::Failed, tx);
+                    }
+                };
+
+                match result.rows_affected() {
+                    1 => (RoomResponse::JoinRequested, tx),
+                    0 => (RoomResponse::NoChange, tx),
+                    _ => unreachable!(),
+                }
+            } else {
+                // Private and non-discoverable: invite-only. Report as
+                // non-existent so the room's existence stays hidden.
+                (RoomResponse::NoRoomExists, tx)
+            }
+        }
+
+        RoomRequest::RemoveRoomMembershipRequest {
+            user_id,
+            room_name,
+            tx,
+        } => {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Remove the caller's membership, resolving the room by name inline.
+            // A non-existent room or a non-member both delete zero rows -> NoChange.
+            // Leaving as the last owner is allowed; ownerless rooms are supported.
+            let result = match sqlx::query(
+                "DELETE FROM memberships
+                    WHERE user_id = $1
+                    AND room_id = (SELECT room_id FROM rooms
+                                   WHERE LOWER(room_name) = LOWER(trim_ws($2)))",
+            )
+            .bind(user_id)
+            .bind(room_name)
+            .execute(&mut *db)
+            .await
+            {
+                Ok(res) => res,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            match result.rows_affected() {
+                1 => (RoomResponse::Success, tx),
+                0 => (RoomResponse::NoChange, tx),
+                _ => unreachable!(),
+            }
+        }
+
+        RoomRequest::GetMyJoinRequests { source_user_id, tx } => {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // The caller's own pending requests -- just the room names.
+            let rooms = match sqlx::query_scalar::<_, String>(
+                "SELECT r.room_name
+                    FROM room_join_requests jr
+                    JOIN rooms r ON r.room_id = jr.room_id
+                    WHERE jr.user_id = $1
+                    ORDER BY jr.created_at",
+            )
+            .bind(source_user_id)
+            .fetch_all(&mut *db)
+            .await
+            {
+                Ok(rooms) => rooms,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            (RoomResponse::MyJoinRequests { rooms }, tx)
+        }
+
+        RoomRequest::GetIncomingJoinRequests { source_user_id, tx } => {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Requests the caller may act on: those for rooms they own, plus --
+            // if the caller is an admin -- every pending request.
+            let requests = match sqlx::query_as::<_, JoinRequestInfo>(
+                "SELECT r.room_name, u.username
+                    FROM room_join_requests jr
+                    JOIN rooms r ON r.room_id = jr.room_id
+                    JOIN users u ON u.user_id = jr.user_id
+                    WHERE EXISTS (SELECT 1 FROM memberships m
+                                  WHERE m.room_id = jr.room_id AND m.user_id = $1 AND m.is_owner)
+                       OR EXISTS (SELECT 1 FROM admins a WHERE a.user_id = $1)
+                    ORDER BY r.room_name, jr.created_at",
+            )
+            .bind(source_user_id)
+            .fetch_all(&mut *db)
+            .await
+            {
+                Ok(requests) => requests,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            (RoomResponse::IncomingJoinRequests { requests }, tx)
+        }
+
+        RoomRequest::ApproveJoinRequest {
+            source_user_id,
+            room_name,
+            requester_username,
+            tx,
+        } => {
+            let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Authorize: caller must own the room (or be an admin). "No such
+            // room" and "not authorized" both return Failed so existence isn't
+            // leaked.
+            let (room_id, authorized) = match gate_room(&mut db, source_user_id, &room_name).await {
+                Ok(Some(gate)) => gate,
+                Ok(None) | Err(_) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            if !authorized {
+                return (RoomResponse::Failed, tx);
+            }
+
+            // Delete the pending request, resolving the requester by name. None
+            // means there was no such pending request -- nothing to approve.
+            let approved_user_id = match sqlx::query_scalar::<_, Uuid>(
+                "DELETE FROM room_join_requests
+                    WHERE room_id = $1
+                    AND user_id = (SELECT user_id FROM users
+                                   WHERE LOWER(username) = LOWER(trim_ws($2)))
+                    RETURNING user_id",
+            )
+            .bind(room_id)
+            .bind(requester_username)
+            .fetch_optional(&mut *db)
+            .await
+            {
+                Ok(maybe_id) => maybe_id,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            let Some(approved_user_id) = approved_user_id else {
+                return (RoomResponse::NoChange, tx);
+            };
+
+            // Admit the requester. ON CONFLICT DO NOTHING in case they became a
+            // member by some other path in the meantime.
+            if let Err(_e) = sqlx::query(
+                "INSERT INTO memberships (room_id, user_id) VALUES ($1, $2)
+                    ON CONFLICT DO NOTHING",
+            )
+            .bind(room_id)
+            .bind(approved_user_id)
+            .execute(&mut *db)
+            .await
+            {
+                // TODO - Logging
+                return (RoomResponse::Failed, tx);
+            }
+
+            match db.commit().await {
+                Ok(_) => (RoomResponse::Success, tx),
+                Err(_e) => {
+                    // TODO - Logging
+                    (RoomResponse::Failed, tx)
+                }
+            }
+        }
+
+        RoomRequest::RejectJoinRequest {
+            source_user_id,
+            room_name,
+            requester_username,
+            tx,
+        } => {
+            let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Authorize: caller must own the room (or be an admin).
+            let gate = match sqlx::query_as::<_, (Uuid, bool)>(
+                "SELECT
+                    r.room_id,
+                    (EXISTS (SELECT 1 FROM memberships m
+                             WHERE m.room_id = r.room_id AND m.user_id = $1 AND m.is_owner)
+                     OR EXISTS (SELECT 1 FROM admins a WHERE a.user_id = $1)) AS authorized
+                FROM rooms r
+                WHERE LOWER(r.room_name) = LOWER(trim_ws($2))
+                FOR UPDATE OF r",
+            )
+            .bind(source_user_id)
+            .bind(room_name)
+            .fetch_optional(&mut *db)
+            .await
+            {
+                Ok(gate) => gate,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Treat "no such room" and "not authorized" identically, so a
+            // non-owner can't probe a private room's existence here.
+            let Some((room_id, authorized)) = gate else {
+                return (RoomResponse::Failed, tx);
+            };
+            if !authorized {
+                return (RoomResponse::Failed, tx);
+            }
+
+            // Drop the pending request. Zero rows -- no such request -- NoChange.
+            let result = match sqlx::query(
+                "DELETE FROM room_join_requests
+                    WHERE room_id = $1
+                    AND user_id = (SELECT user_id FROM users
+                                   WHERE LOWER(username) = LOWER(trim_ws($2)))",
+            )
+            .bind(room_id)
+            .bind(requester_username)
+            .execute(&mut *db)
+            .await
+            {
+                Ok(res) => res,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            match result.rows_affected() {
+                0 => (RoomResponse::NoChange, tx),
+                _ => match db.commit().await {
+                    Ok(_) => (RoomResponse::Success, tx),
+                    Err(_e) => {
+                        // TODO - Logging
+                        (RoomResponse::Failed, tx)
+                    }
+                },
+            }
+        }
+
+        RoomRequest::InviteToRoom {
+            source_user_id,
+            room_name,
+            invitee_username,
+            tx,
+        } => {
+            let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Authorize: only an owner (or admin) may invite. Missing room and
+            // not-authorized both return Failed so existence isn't leaked.
+            let (room_id, authorized) = match gate_room(&mut db, source_user_id, &room_name).await {
+                Ok(Some(gate)) => gate,
+                Ok(None) | Err(_) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            if !authorized {
+                return (RoomResponse::Failed, tx);
+            }
+
+            // Resolve the invitee. No such user -> Failed.
+            let invitee_id = match sqlx::query_scalar::<_, Uuid>(
+                "SELECT user_id FROM users WHERE LOWER(username) = LOWER(trim_ws($1))",
+            )
+            .bind(invitee_username)
+            .fetch_optional(&mut *db)
+            .await
+            {
+                Ok(maybe_id) => maybe_id,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            let Some(invitee_id) = invitee_id else {
+                return (RoomResponse::Failed, tx);
+            };
+
+            // Record the invite, but not for someone already a member. ON CONFLICT
+            // DO NOTHING drops a duplicate invite. 0 rows == already a member or
+            // already invited -> NoChange.
+            let result = match sqlx::query(
+                "INSERT INTO room_invites (room_id, user_id, invited_by)
+                    SELECT $1, $2, $3
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM memberships m
+                        WHERE m.room_id = $1 AND m.user_id = $2)
+                    ON CONFLICT DO NOTHING",
+            )
+            .bind(room_id)
+            .bind(invitee_id)
+            .bind(source_user_id)
+            .execute(&mut *db)
+            .await
+            {
+                Ok(res) => res,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            match result.rows_affected() {
+                1 => match db.commit().await {
+                    Ok(_) => (RoomResponse::Success, tx),
+                    Err(_e) => {
+                        // TODO - Logging
+                        (RoomResponse::Failed, tx)
+                    }
+                },
+                0 => (RoomResponse::NoChange, tx),
+                _ => unreachable!(),
+            }
+        }
+
+        RoomRequest::GetMyInvites { source_user_id, tx } => {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Rooms the caller has been invited to -- just the names.
+            let rooms = match sqlx::query_scalar::<_, String>(
+                "SELECT r.room_name
+                    FROM room_invites ri
+                    JOIN rooms r ON r.room_id = ri.room_id
+                    WHERE ri.user_id = $1
+                    ORDER BY ri.created_at",
+            )
+            .bind(source_user_id)
+            .fetch_all(&mut *db)
+            .await
+            {
+                Ok(rooms) => rooms,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            (RoomResponse::MyInvites { rooms }, tx)
+        }
+
+        RoomRequest::AcceptInvite {
+            user_id,
+            room_name,
+            tx,
+        } => {
+            let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Consume the caller's invite, resolving the room by name. None means
+            // there was no invite for this caller -> nothing to accept.
+            let accepted_room_id = match sqlx::query_scalar::<_, Uuid>(
+                "DELETE FROM room_invites
+                    WHERE user_id = $1
+                    AND room_id = (SELECT room_id FROM rooms
+                                   WHERE LOWER(room_name) = LOWER(trim_ws($2)))
+                    RETURNING room_id",
+            )
+            .bind(user_id)
+            .bind(room_name)
+            .fetch_optional(&mut *db)
+            .await
+            {
+                Ok(maybe_id) => maybe_id,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            let Some(room_id) = accepted_room_id else {
+                return (RoomResponse::NoChange, tx);
+            };
+
+            // Join the room. ON CONFLICT DO NOTHING in case membership already
+            // exists by some other path.
+            if let Err(_e) = sqlx::query(
+                "INSERT INTO memberships (room_id, user_id) VALUES ($1, $2)
+                    ON CONFLICT DO NOTHING",
+            )
+            .bind(room_id)
+            .bind(user_id)
+            .execute(&mut *db)
+            .await
+            {
+                // TODO - Logging
+                return (RoomResponse::Failed, tx);
+            }
+
+            match db.commit().await {
+                Ok(_) => (RoomResponse::Success, tx),
+                Err(_e) => {
+                    // TODO - Logging
+                    (RoomResponse::Failed, tx)
+                }
+            }
+        }
+
+        RoomRequest::DeclineInvite {
+            user_id,
+            room_name,
+            tx,
+        } => {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Drop the caller's invite. Zero rows -> no such invite -> NoChange.
+            let result = match sqlx::query(
+                "DELETE FROM room_invites
+                    WHERE user_id = $1
+                    AND room_id = (SELECT room_id FROM rooms
+                                   WHERE LOWER(room_name) = LOWER(trim_ws($2)))",
+            )
+            .bind(user_id)
+            .bind(room_name)
+            .execute(&mut *db)
+            .await
+            {
+                Ok(res) => res,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            match result.rows_affected() {
+                1 => (RoomResponse::Success, tx),
+                0 => (RoomResponse::NoChange, tx),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+// Resolve a room by name and decide whether `source_user_id` may act on it as an
+// owner or admin, locking the room row (FOR UPDATE) for the rest of the caller's
+// transaction. Returns None when no such room exists; the boolean is the
+// owner-or-admin authorization. Callers must run inside a transaction for the
+// lock to hold.
+async fn gate_room(
+    db: &mut sqlx::PgConnection,
+    source_user_id: Uuid,
+    room_name: &str,
+) -> Result<Option<(Uuid, bool)>, sqlx::Error> {
+    sqlx::query_as::<_, (Uuid, bool)>(
+        "SELECT
+            r.room_id,
+            (EXISTS (SELECT 1 FROM memberships m
+                     WHERE m.room_id = r.room_id AND m.user_id = $1 AND m.is_owner)
+             OR EXISTS (SELECT 1 FROM admins a WHERE a.user_id = $1)) AS authorized
+        FROM rooms r
+        WHERE LOWER(r.room_name) = LOWER(trim_ws($2))
+        FOR UPDATE OF r",
+    )
+    .bind(source_user_id)
+    .bind(room_name)
+    .fetch_optional(db)
+    .await
+}
