@@ -523,14 +523,12 @@ async fn handle_request(
                 return (UserResponse::Failed, tx);
             };
 
-            if let Err(_e) = sqlx::query("UPDATE rooms SET owner_id = (SELECT user_id FROM admins WHERE is_default = true) WHERE owner_id = $1")
-                .bind(target_user_id)
-                .execute(&mut *db)
-                .await
-            {
-                // TODO - Logging
-                return (UserResponse::Failed, tx);
-            };
+            // No room-ownership cleanup needed: ownership is a flag on memberships,
+            // which cascade-delete with the user. A room may be left with no owners
+            // -- that's allowed, not an error, because every owner-gated action also
+            // permits admins, so an admin can re-grant ownership to a member. We
+            // deliberately don't escalate to the default admin, so it never
+            // accumulates ownership of orphaned rooms.
 
             let success = match sqlx::query("DELETE FROM users WHERE user_id = $1")
                 .bind(target_user_id)

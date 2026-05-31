@@ -265,3 +265,83 @@ pub async fn fetch_user_info(ws: &mut Ws, target_username: &str) -> UserInfoFiel
         other => panic!("expected UserInfo for {target_username:?}, got {other:?}"),
     }
 }
+
+// ##### Room seeding #####
+
+// Insert a room and seed `owner_username` as its first owner-member, mirroring
+// what NewRoom does but directly, so tests can set up preconditions without
+// going through the protocol.
+pub async fn seed_room(
+    pool: &PgPool,
+    room_name: &str,
+    owner_username: &str,
+    is_public: bool,
+    is_discoverable: bool,
+) {
+    sqlx::query("INSERT INTO rooms (room_name, is_public, is_discoverable) VALUES ($1, $2, $3)")
+        .bind(room_name)
+        .bind(is_public)
+        .bind(is_discoverable)
+        .execute(pool)
+        .await
+        .expect("failed to seed room");
+
+    sqlx::query(
+        "INSERT INTO memberships (room_id, user_id, is_owner)
+         SELECT r.room_id, u.user_id, true
+         FROM rooms r, users u
+         WHERE r.room_name = $1 AND u.username = $2",
+    )
+    .bind(room_name)
+    .bind(owner_username)
+    .execute(pool)
+    .await
+    .expect("failed to seed room owner");
+}
+
+// Add `username` as a plain (non-owner) member of `room_name`.
+pub async fn seed_membership(pool: &PgPool, room_name: &str, username: &str) {
+    sqlx::query(
+        "INSERT INTO memberships (room_id, user_id, is_owner)
+         SELECT r.room_id, u.user_id, false
+         FROM rooms r, users u
+         WHERE r.room_name = $1 AND u.username = $2",
+    )
+    .bind(room_name)
+    .bind(username)
+    .execute(pool)
+    .await
+    .expect("failed to seed membership");
+}
+
+// True if `username` is a member of `room_name` (owner or not).
+pub async fn is_member(pool: &PgPool, room_name: &str, username: &str) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM memberships m
+            JOIN rooms r ON r.room_id = m.room_id
+            JOIN users u ON u.user_id = m.user_id
+            WHERE r.room_name = $1 AND u.username = $2)",
+    )
+    .bind(room_name)
+    .bind(username)
+    .fetch_one(pool)
+    .await
+    .expect("membership query failed")
+}
+
+// True if `username` is an owner of `room_name`.
+pub async fn is_owner(pool: &PgPool, room_name: &str, username: &str) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM memberships m
+            JOIN rooms r ON r.room_id = m.room_id
+            JOIN users u ON u.user_id = m.user_id
+            WHERE r.room_name = $1 AND u.username = $2 AND m.is_owner)",
+    )
+    .bind(room_name)
+    .bind(username)
+    .fetch_one(pool)
+    .await
+    .expect("ownership query failed")
+}

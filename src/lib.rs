@@ -3,5 +3,6 @@ pub mod auth;
 pub mod config;
 pub mod handler;
 pub mod model;
+pub mod room;
 pub mod server;
 pub mod user;
