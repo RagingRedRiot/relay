@@ -1,7 +1,11 @@
 pub mod app;
+pub mod attachment;
 pub mod auth;
 pub mod config;
+pub mod control;
 pub mod handler;
+pub mod hub;
+pub mod message;
 pub mod model;
 pub mod reaper;
 pub mod room;

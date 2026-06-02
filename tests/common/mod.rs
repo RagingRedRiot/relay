@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use sqlx::PgPool;
 use tokio_tungstenite::WebSocketStream;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 pub use futures_util::{SinkExt, StreamExt};
 pub use tokio_tungstenite::tungstenite::Message;
@@ -24,6 +25,10 @@ pub struct TestServer {
     pub addr: SocketAddr,
     pub pool: PgPool,
     pub shutdown: CancellationToken,
+    // Receiving end of the lifecycle control channel. In production the supervisor
+    // in `main` consumes this; here a test holds it so it can assert that a
+    // RestartServer / ShutdownServer command actually signaled.
+    pub control_rx: tokio::sync::mpsc::Receiver<relay::control::ControlSignal>,
 }
 
 /// Serve the app on an ephemeral port against the given (`#[sqlx::test]`) pool.
@@ -41,7 +46,17 @@ pub async fn spawn_app(pool: PgPool, configure: impl FnOnce(&mut Config)) -> Tes
 
     let shutdown = CancellationToken::new();
     let auth_handle = relay::auth::spawn(shutdown.clone(), pool.clone()).await;
-    let app = relay::app::app(shutdown.clone(), auth_handle, config, pool.clone()).await;
+    // The control receiver is handed to the TestServer rather than a supervisor, so
+    // lifecycle-command tests can observe the emitted signal.
+    let (control_tx, control_rx) = tokio::sync::mpsc::channel(8);
+    let app = relay::app::app(
+        shutdown.clone(),
+        auth_handle,
+        config,
+        pool.clone(),
+        relay::control::ServerControl::new(control_tx),
+    )
+    .await;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -62,6 +77,7 @@ pub async fn spawn_app(pool: PgPool, configure: impl FnOnce(&mut Config)) -> Tes
         addr,
         pool,
         shutdown,
+        control_rx,
     }
 }
 
@@ -152,6 +168,18 @@ pub async fn send_text(ws: &mut Ws, text: impl Into<String>) {
     ws.send(Message::Text(text.into())).await.unwrap();
 }
 
+// Send one upload chunk as a binary frame, mirroring the wire layout the server
+// parses in process_binary: [attachment_id 16B][seq u32 big-endian 4B][payload].
+pub async fn send_chunk_frame(ws: &mut Ws, attachment_id: Uuid, seq: i32, payload: &[u8]) {
+    let mut frame = Vec::with_capacity(20 + payload.len());
+    frame.extend_from_slice(attachment_id.as_bytes());
+    frame.extend_from_slice(&(seq as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    ws.send(Message::Binary(frame.into()))
+        .await
+        .expect("failed to send chunk frame");
+}
+
 // Read the next frame and parse it as a ServerEvent.
 pub async fn next_event(ws: &mut Ws) -> ServerEvent {
     let msg = ws
@@ -162,6 +190,19 @@ pub async fn next_event(ws: &mut Ws) -> ServerEvent {
     let text = msg.to_text().expect("expected a text frame");
     serde_json::from_str::<ServerEvent>(text)
         .unwrap_or_else(|e| panic!("not a ServerEvent ({e}): {text:?}"))
+}
+
+// Read the next command *reply*, skipping live push events (NewMessage, Resync)
+// that interleave on the shared socket once a session is subscribed to room
+// fan-out. Use this anywhere a specific reply is expected; use next_event when the
+// push events themselves are under test.
+pub async fn next_reply(ws: &mut Ws) -> ServerEvent {
+    loop {
+        match next_event(ws).await {
+            ServerEvent::NewMessage { .. } | ServerEvent::Resync { .. } => continue,
+            other => return other,
+        }
+    }
 }
 
 // Assert the next frame is a Close frame.
@@ -297,6 +338,15 @@ pub async fn seed_room(
     .execute(pool)
     .await
     .expect("failed to seed room owner");
+}
+
+// Resolve a room's id by name.
+pub async fn room_id(pool: &PgPool, room_name: &str) -> Uuid {
+    sqlx::query_scalar("SELECT room_id FROM rooms WHERE room_name = $1")
+        .bind(room_name)
+        .fetch_one(pool)
+        .await
+        .expect("room lookup failed")
 }
 
 // Add `username` as a plain (non-owner) member of `room_name`.

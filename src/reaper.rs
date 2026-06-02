@@ -4,6 +4,13 @@ use sqlx::PgPool;
 use tokio::{select, time};
 use tokio_util::sync::CancellationToken;
 
+// Grace period for uploads abandoned mid-stream. Their parent message is younger
+// than retention_days (else the message rule would take them first), so they need
+// their own sweep. Generous enough that a stalled client can still resume by
+// filling the missing seqs; short enough that orphaned partials don't sit for the
+// full retention window. Matches the ~24h the schema's partial index is sized for.
+const INCOMPLETE_UPLOAD_GRACE_HOURS: i32 = 24;
+
 pub fn spawn(shutdown: CancellationToken, pool: PgPool, retention_days: i32, interval: Duration) {
     tokio::spawn(async move {
         let mut tick = time::interval(interval);
@@ -52,6 +59,20 @@ pub async fn reap(pool: &PgPool, retention_days: i32) -> Result<(), sqlx::Error>
         "DELETE FROM room_join_requests WHERE created_at < now() - make_interval(days => $1)",
     )
     .bind(retention_days)
+    .execute(&mut *tx)
+    .await?;
+
+    // Uploads abandoned mid-stream: the attachment row and any partial chunks were
+    // committed alongside a still-young message, so neither the message rule above
+    // nor the parent's ON DELETE CASCADE will reclaim them. Sweep incomplete rows
+    // past the grace period; their chunks cascade. Completed attachments are left
+    // to age out with their message. Uses the message_attachments_incomplete index.
+    sqlx::query(
+        "DELETE FROM message_attachments
+            WHERE NOT is_complete
+              AND created_at < now() - make_interval(hours => $1)",
+    )
+    .bind(INCOMPLETE_UPLOAD_GRACE_HOURS)
     .execute(&mut *tx)
     .await?;
 

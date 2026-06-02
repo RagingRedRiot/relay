@@ -4,6 +4,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::hub::Hub;
 use crate::model::{self, JoinRequestInfo, PublicUser, Room};
 
 pub enum RoomRequest {
@@ -428,7 +429,7 @@ impl RoomHandle {
     }
 }
 
-pub async fn spawn(shutdown: CancellationToken, pool: PgPool) -> RoomHandle {
+pub async fn spawn(shutdown: CancellationToken, pool: PgPool, hub: Hub) -> RoomHandle {
     // ROOM ACTOR COMMUNICATION CHANNELS
     // rx stays in the spawned actor
     // tx gets returned in RoomHandle
@@ -442,7 +443,7 @@ pub async fn spawn(shutdown: CancellationToken, pool: PgPool) -> RoomHandle {
             select! {
                 req = rx.recv() => {
                     let Some(req) = req else { break };
-                    let (result, req_tx) = handle_request(req, pool.clone()).await;
+                    let (result, req_tx) = handle_request(req, pool.clone(), &hub).await;
                     let _ = req_tx.send(result);
                 }
                 _ = shutdown.cancelled() => {
@@ -459,6 +460,7 @@ pub async fn spawn(shutdown: CancellationToken, pool: PgPool) -> RoomHandle {
 async fn handle_request(
     req: RoomRequest,
     pool: PgPool,
+    hub: &Hub,
 ) -> (RoomResponse, oneshot::Sender<RoomResponse>) {
     match req {
         RoomRequest::NewRoomRequest {
@@ -888,8 +890,13 @@ async fn handle_request(
             if room.is_public {
                 // Public: join immediately. ON CONFLICT DO NOTHING makes a
                 // repeat join a no-op (0 rows) rather than an error.
+                // Start caught up: the watermark is the room's newest message at
+                // join time, so a new member's history isn't a wall of "unread".
                 let result = match sqlx::query(
-                    "INSERT INTO memberships (room_id, user_id) VALUES ($1, $2)
+                    "INSERT INTO memberships (room_id, user_id, last_read_message_id)
+                        VALUES ($1, $2,
+                                (SELECT message_id FROM messages
+                             WHERE room_id = $1 ORDER BY message_id DESC LIMIT 1))
                         ON CONFLICT DO NOTHING",
                 )
                 .bind(room.room_id)
@@ -1109,8 +1116,12 @@ async fn handle_request(
 
             // Admit the requester. ON CONFLICT DO NOTHING in case they became a
             // member by some other path in the meantime.
+            // Start caught up: watermark = newest message at admission time.
             if let Err(_e) = sqlx::query(
-                "INSERT INTO memberships (room_id, user_id) VALUES ($1, $2)
+                "INSERT INTO memberships (room_id, user_id, last_read_message_id)
+                    VALUES ($1, $2,
+                            (SELECT message_id FROM messages
+                             WHERE room_id = $1 ORDER BY message_id DESC LIMIT 1))
                     ON CONFLICT DO NOTHING",
             )
             .bind(room_id)
@@ -1122,8 +1133,30 @@ async fn handle_request(
                 return (RoomResponse::Failed, tx);
             }
 
+            // The canonical room name, for the live subscription's Resync hint.
+            let room_name = match sqlx::query_scalar::<_, String>(
+                "SELECT room_name FROM rooms WHERE room_id = $1",
+            )
+            .bind(room_id)
+            .fetch_one(&mut *db)
+            .await
+            {
+                Ok(name) => name,
+                Err(_e) => {
+                    // TODO - Logging
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
             match db.commit().await {
-                Ok(_) => (RoomResponse::Success, tx),
+                Ok(_) => {
+                    // Cross-session: the admitted user isn't the caller. If any of
+                    // their sessions are online, subscribe those sessions to the
+                    // room's live stream now, so they get messages without
+                    // reconnecting. Offline users subscribe on their next connect.
+                    hub.subscribe_user_to_room(approved_user_id, room_id, room_name);
+                    (RoomResponse::Success, tx)
+                }
                 Err(_e) => {
                     // TODO - Logging
                     (RoomResponse::Failed, tx)
@@ -1363,8 +1396,12 @@ async fn handle_request(
 
             // Join the room. ON CONFLICT DO NOTHING in case membership already
             // exists by some other path.
+            // Start caught up: watermark = newest message at accept time.
             if let Err(_e) = sqlx::query(
-                "INSERT INTO memberships (room_id, user_id) VALUES ($1, $2)
+                "INSERT INTO memberships (room_id, user_id, last_read_message_id)
+                    VALUES ($1, $2,
+                            (SELECT message_id FROM messages
+                             WHERE room_id = $1 ORDER BY message_id DESC LIMIT 1))
                     ON CONFLICT DO NOTHING",
             )
             .bind(room_id)

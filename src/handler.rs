@@ -24,7 +24,16 @@ pub(crate) async fn ws_handler(
     };
     // TODO tracing
     println!("{user_agent} at {addr} connected.");
-    ws.on_upgrade(move |socket| handle_socket(socket, state, addr))
+
+    // Pin both the message and frame size caps to the configured max chunk payload
+    // (plus the frame header) so the limit a client learns from GetMaxChunkSize is
+    // the real one -- not undercut by tungstenite's smaller default frame cap. A
+    // chunk over this is dropped by the transport (connection closed), so a
+    // well-behaved client queries the limit and stays under it.
+    let frame_cap = state.config.max_chunk_bytes + crate::attachment::CHUNK_HEADER_LEN;
+    ws.max_message_size(frame_cap)
+        .max_frame_size(frame_cap)
+        .on_upgrade(move |socket| handle_socket(socket, state, addr))
 }
 
 pub(crate) async fn index() -> Html<&'static str> {
