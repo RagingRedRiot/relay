@@ -5,6 +5,7 @@ pub mod config;
 pub mod control;
 pub mod handler;
 pub mod hub;
+pub mod logging;
 pub mod message;
 pub mod model;
 pub mod reaper;

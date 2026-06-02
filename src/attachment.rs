@@ -103,8 +103,10 @@ pub fn spawn(
 
             let inserted = match inserted {
                 Ok(result) => result,
-                Err(_) => {
-                    // TODO - Logging. FK gone (attachment reaped) or DB error.
+                Err(e) => {
+                    // Often a benign FK-gone (the attachment was reaped mid-upload);
+                    // could also be a real DB error. Either way, abandon this upload.
+                    tracing::warn!(error = %e, %attachment_id, "upload: chunk insert failed (attachment reaped or DB error)");
                     break;
                 }
             };
@@ -123,8 +125,8 @@ pub fn spawn(
             .await
             {
                 Ok(count) => count,
-                Err(_) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %attachment_id, "upload: chunk count query failed");
                     break;
                 }
             };
@@ -160,7 +162,8 @@ pub fn spawn(
                     // All chunks present but content doesn't match the declared
                     // hash/size. Keep-first means re-sending can't fix it; leave the
                     // row incomplete for the reaper and report a generic failure.
-                    // TODO - Logging (details server-side only)
+                    // Details stay server-side; the client only sees a generic error.
+                    tracing::warn!(%attachment_id, "upload: content does not match declared hash/size");
                     let _ = user_tx
                         .send(ServerEvent::Error {
                             error: "attachment upload failed".to_owned(),
@@ -168,8 +171,8 @@ pub fn spawn(
                         .await;
                     break;
                 }
-                Err(_) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %attachment_id, "upload: verification query failed");
                     break;
                 }
             }
@@ -223,8 +226,8 @@ pub fn download(
                     .await;
                 return;
             }
-            Err(_) => {
-                // TODO - Logging
+            Err(e) => {
+                tracing::error!(error = %e, %attachment_id, "download: lookup query failed");
                 let _ = user_tx.send(ServerEvent::Failed).await;
                 return;
             }
@@ -254,8 +257,13 @@ pub fn download(
                 Ok(Some(data)) => data,
                 // A gap in a "complete" attachment shouldn't be possible; stop and
                 // report a generic failure rather than send a truncated stream.
-                Ok(None) | Err(_) => {
-                    // TODO - Logging
+                Ok(None) => {
+                    tracing::error!(%attachment_id, seq, "download: missing chunk in a complete attachment");
+                    let _ = user_tx.send(ServerEvent::Failed).await;
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, %attachment_id, seq, "download: chunk fetch failed");
                     let _ = user_tx.send(ServerEvent::Failed).await;
                     return;
                 }

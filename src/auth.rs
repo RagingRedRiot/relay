@@ -22,8 +22,17 @@ struct AuthRequest {
 
 #[derive(Debug)]
 pub enum AuthResult {
-    Ok { user_id: Uuid },
+    Ok {
+        user_id: Uuid,
+    },
+    /// Credentials were rejected: unknown user or wrong password. A genuine
+    /// authentication failure, audited as such by the caller.
     Failed,
+    /// The attempt could not be completed due to a server-side fault (DB error,
+    /// corrupt stored hash, auth actor gone). Already logged at `error!` where it
+    /// occurs; the caller treats it as no-auth but does NOT audit it as a failed
+    /// login, since the credentials were never actually judged.
+    Error,
 }
 
 #[derive(Clone)]
@@ -47,9 +56,9 @@ impl AuthHandle {
             .await
             .is_err()
         {
-            return AuthResult::Failed;
+            return AuthResult::Error;
         }
-        rx.await.unwrap_or(AuthResult::Failed)
+        rx.await.unwrap_or(AuthResult::Error)
     }
 }
 
@@ -70,9 +79,9 @@ async fn authenticate(
     .await
     {
         Ok(maybe_data) => maybe_data,
-        Err(_e) => {
-            // TODO - Logging
-            return AuthResult::Failed;
+        Err(e) => {
+            tracing::error!(error = %e, "auth: credential lookup query failed");
+            return AuthResult::Error;
         }
     };
 
@@ -80,9 +89,9 @@ async fn authenticate(
         Some((user_id, hash)) => {
             let parsed = match PasswordHash::new(&hash) {
                 Ok(parsed) => parsed,
-                Err(_e) => {
-                    // TODO - Logging
-                    return AuthResult::Failed;
+                Err(e) => {
+                    tracing::error!(error = %e, %user_id, "auth: stored password hash is unparseable");
+                    return AuthResult::Error;
                 }
             };
             let verified = Argon2::default()
@@ -95,9 +104,11 @@ async fn authenticate(
             // Perform a dummy check to take the same amount of time as if the user exists
             let parsed = match PasswordHash::new(&dummy_hash) {
                 Ok(parsed) => parsed,
-                Err(_e) => {
-                    // TODO - Logging
-                    return AuthResult::Failed;
+                Err(e) => {
+                    // The dummy hash is generated once at startup, so this should be
+                    // unreachable -- log loudly if it ever isn't.
+                    tracing::error!(error = %e, "auth: dummy password hash is unparseable");
+                    return AuthResult::Error;
                 }
             };
             let _ = Argon2::default()

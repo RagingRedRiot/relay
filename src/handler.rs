@@ -22,8 +22,7 @@ pub(crate) async fn ws_handler(
     } else {
         String::from("Unknown browser")
     };
-    // TODO tracing
-    println!("{user_agent} at {addr} connected.");
+    tracing::debug!(who = %addr, %user_agent, "connection accepted");
 
     // Pin both the message and frame size caps to the configured max chunk payload
     // (plus the frame header) so the limit a client learns from GetMaxChunkSize is

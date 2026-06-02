@@ -284,8 +284,8 @@ async fn handle_request(
         } => {
             let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "send_message: begin transaction failed");
                     return (MessageResponse::Failed, tx);
                 }
             };
@@ -307,8 +307,8 @@ async fn handle_request(
             {
                 Ok(Some(name)) => name,
                 Ok(None) => return (MessageResponse::Failed, tx),
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %room_id, "send_message: room membership lookup failed");
                     return (MessageResponse::Failed, tx);
                 }
             };
@@ -319,25 +319,29 @@ async fn handle_request(
             // server-assigned timestamp, the (round-tripped) content, and the
             // sender's current display name so the same canonical item can go in the
             // ack and the live broadcast.
-            let (message_id, timestamp, content, sender_username) =
-                match sqlx::query_as::<_, (Uuid, chrono::DateTime<chrono::Utc>, String, String)>(
-                    "INSERT INTO messages (room_id, sender_id, content)
+            let (message_id, timestamp, content, sender_username) = match sqlx::query_as::<
+                _,
+                (Uuid, chrono::DateTime<chrono::Utc>, String, String),
+            >(
+                "INSERT INTO messages (room_id, sender_id, content)
                         VALUES ($1, $2, $3)
                         RETURNING message_id, timestamp, content,
                                   (SELECT username FROM users WHERE user_id = $2)",
-                )
-                .bind(room_id)
-                .bind(sender_id)
-                .bind(content)
-                .fetch_one(&mut *db)
-                .await
-                {
-                    Ok(row) => row,
-                    Err(_e) => {
-                        // TODO - Logging
-                        return (MessageResponse::Failed, tx);
-                    }
-                };
+            )
+            .bind(room_id)
+            .bind(sender_id)
+            .bind(content)
+            .fetch_one(&mut *db)
+            .await
+            {
+                Ok(row) => row,
+                Err(e) => {
+                    // Empty content trips the table CHECK -- a client error rather
+                    // than a server fault, so warn rather than error.
+                    tracing::warn!(error = %e, %room_id, "send_message: message insert failed (e.g. empty content)");
+                    return (MessageResponse::Failed, tx);
+                }
+            };
 
             // Create one incomplete attachment row per declaration, in order, so
             // the returned ids line up with the client's `attachments`. The bytes
@@ -372,8 +376,9 @@ async fn handle_request(
                 .await
                 {
                     Ok(id) => id,
-                    Err(_e) => {
-                        // TODO - Logging
+                    Err(e) => {
+                        // A malformed declaration trips a table CHECK -- client error.
+                        tracing::warn!(error = %e, %message_id, "send_message: attachment insert failed (e.g. malformed declaration)");
                         return (MessageResponse::Failed, tx);
                     }
                 };
@@ -393,7 +398,7 @@ async fn handle_request(
             // watermark to this message so their own posts never show as unread to
             // them. Forward-only guard, though the just-inserted id is always the
             // newest. Part of the same transaction as the insert.
-            if let Err(_e) = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "UPDATE memberships
                     SET last_read_message_id = $3
                     WHERE room_id = $1 AND user_id = $2
@@ -405,7 +410,7 @@ async fn handle_request(
             .execute(&mut *db)
             .await
             {
-                // TODO - Logging
+                tracing::error!(error = %e, %room_id, %message_id, "send_message: sender watermark update failed");
                 return (MessageResponse::Failed, tx);
             }
 
@@ -443,8 +448,8 @@ async fn handle_request(
                         tx,
                     )
                 }
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %room_id, %message_id, "send_message: commit failed");
                     (MessageResponse::Failed, tx)
                 }
             }
@@ -480,8 +485,9 @@ async fn handle_request(
 
             match result {
                 Ok(_) => (MessageResponse::Success, tx),
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    // An empty emoji trips the table CHECK -- client error.
+                    tracing::warn!(error = %e, %message_id, "add_reaction: insert failed (e.g. empty emoji)");
                     (MessageResponse::Failed, tx)
                 }
             }
@@ -514,8 +520,8 @@ async fn handle_request(
 
             match result {
                 Ok(_) => (MessageResponse::Success, tx),
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %message_id, "remove_reaction: delete failed");
                     (MessageResponse::Failed, tx)
                 }
             }
@@ -538,8 +544,8 @@ async fn handle_request(
             let room_id = match resolve_member_room(&pool, &room_name, user_id).await {
                 Ok(Some(id)) => id,
                 Ok(None) => return (MessageResponse::Failed, tx),
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "get_messages: room resolution failed");
                     return (MessageResponse::Failed, tx);
                 }
             };
@@ -552,8 +558,8 @@ async fn handle_request(
                     },
                     tx,
                 ),
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %room_id, "get_messages: history query failed");
                     (MessageResponse::Failed, tx)
                 }
             }
@@ -570,8 +576,8 @@ async fn handle_request(
             let room_id = match resolve_member_room(&pool, &room_name, user_id).await {
                 Ok(Some(id)) => id,
                 Ok(None) => return (MessageResponse::Failed, tx),
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "mark_read: room resolution failed");
                     return (MessageResponse::Failed, tx);
                 }
             };
@@ -596,8 +602,8 @@ async fn handle_request(
 
             match result {
                 Ok(_) => (MessageResponse::Success, tx),
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %room_id, "mark_read: watermark update failed");
                     (MessageResponse::Failed, tx)
                 }
             }
@@ -630,8 +636,8 @@ async fn handle_request(
                         .collect();
                     (MessageResponse::UnreadSummary { rooms }, tx)
                 }
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %user_id, "get_unread_summary: query failed");
                     (MessageResponse::Failed, tx)
                 }
             }
