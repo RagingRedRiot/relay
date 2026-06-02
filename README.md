@@ -2,29 +2,31 @@
 
 A self-hosted real-time chat platform written in async Rust.
 
-> **Status:** Early development — interfaces will change as rooms and messaging are added. Not production ready.
+> **Status:** Early development. Not production ready.
 
 ## Overview
 
-Relay is a WebSocket chat server built on Axum, Tokio, and Postgres. Clients exchange a tagged JSON protocol over WebSocket; the server handles connection lifecycle, per-IP rate limiting, and graceful shutdown around it. User accounts, credentials, and admin authority are persisted in Postgres; password verification uses Argon2id.
+Relay is a WebSocket chat server built on Axum, Tokio, and Postgres. Clients exchange a tagged JSON protocol over WebSocket; the server handles connection lifecycle, per-IP rate limiting, and graceful shutdown around it. Accounts, rooms, messages, attachments, reactions, and read state are persisted in Postgres; password verification uses Argon2id. Messages fan out to connected room members in real time.
 
-The project is being built layer by layer — connection handling first, then the protocol shape, then real authentication and user management.
+> **Developer documentation** — for a full map of how the system is threaded together (actors, per-connection tasks, the fan-out hub, the request lifecycle) plus reference catalogs for the wire protocol, channels, and data model, see [`docs/`](docs/), starting with [`docs/architecture.md`](docs/architecture.md).
 
 ## Architecture
 
-**Actor-per-domain.** The two stateful domains — authentication and user management — each run as their own task. Callers interact through a handle (mpsc request in, oneshot reply back). This keeps domain logic on a single task, removes the need for locks around shared state, and gives each domain a clear seam for tests.
+**Actor-per-domain.** Each stateful domain — authentication, users, rooms, messaging — runs as its own task. Callers interact through a handle (mpsc request in, oneshot reply back). This keeps domain logic on a single task, removes the need for locks around shared state, and gives each domain a clear seam for tests. Real-time delivery uses a separate in-memory fan-out hub; a periodic reaper ages out old data. See [`docs/architecture.md`](docs/architecture.md) for the full picture.
 
 **Library + binary split.** Production code lives in the `relay` library; the binary is a thin entry point that loads config and wires everything together. Integration tests build the real `app()` against a real Postgres database and exercise the WebSocket protocol end-to-end — no mocks of the database or auth path.
 
-**Cancellation as a first-class concern.** Every long-lived task takes a `CancellationToken`. On `SIGTERM` or Ctrl-C the root token cancels and tasks shut down cooperatively. A dedicated shutdown test guards against regressions.
+**Cancellation as a first-class concern.** Each server pass runs under a `CancellationToken` that every actor holds and every connection child-clones, so one cancel tears the whole tree down cooperatively. A supervisor loop in `main` owns that token: SIGTERM/Ctrl-C or an admin restart/shutdown command cancels the current pass, and the supervisor then re-initializes or exits. A dedicated shutdown test guards against regressions.
 
 **Schema migrations via sqlx.** All schema is defined in versioned migration files. A bootstrap path ensures the default admin exists on startup from environment config, so a fresh deployment is never left without an entry point.
 
 ## Design choices
 
-**Minimal client-event vocabulary.** The protocol intentionally collapses many backend outcomes into a small fixed set of `ServerEvent`s (`Success`, `Failed`, `NoChange`, `NoUserExists`, `NoAuth`, …). A legitimate client can't act on richer detail. Exposing distinct events for "wrong password" vs "no such user" vs "malformed JSON" mainly helps spoofed clients map backend state. Detail is intended to live in server-side logs (see Roadmap), not on the wire.
+**Minimal client-event vocabulary.** The protocol intentionally collapses many backend outcomes into a small fixed set of `ServerEvent`s (`Success`, `Failed`, `NoChange`, `NoAuth`, …). A legitimate client can't act on richer detail. Exposing distinct events for "wrong password" vs "malformed JSON" mainly helps map backend state. Detail is intended to live in server-side logs (see Roadmap), not on the wire.
 
 **Flat admin tier with a protected default admin.** Admins are peers — any admin can edit, delete, promote, or demote any user. The single exception is the default admin, who can't be edited, deleted, demoted, or password-updated through the app; their credentials are managed via environment config and applied on startup. The role is break-glass: if every other admin is compromised, the maintainer logs in with the bootstrap credentials and prunes. Requiring default-admin authority for routine admin-on-admin moves would push that account into daily use and erode its purpose.
+
+**Config-on-disk is authoritative for the bind address and default admin.** These are deliberately not changeable from inside the running app. The config file is loaded into the environment once at process start, and the listen socket is bound once and held across in-app restarts, so an admin `RestartServer` re-initializes live state without re-reading the config or moving the port. Changing the bind address or the default admin's username/password means editing the config on disk and performing a **true** process restart (a real stop/start, or `ShutdownServer` then relaunch) — see [`docs/architecture.md`](docs/architecture.md) §9.
 
 **Just-in-time authorization.** Admin status is re-checked at the moment of each privileged action, not cached for the session. A demoted admin loses authority on their next command, on the same socket. The cost is one extra database read per privileged call; the gain is no class of stale-session privilege bugs.
 
@@ -42,31 +44,35 @@ The consequence is that the in-app surface is not where the most consequential a
 
 ## Schema
 
-The implemented domain lives in four tables:
+Schema is defined in versioned `sqlx` migrations and spans the user, room, and messaging domains:
 
-- `users` — profile fields keyed by UUIDv7.
-- `credentials` — password hash and last-set timestamp, 1:1 with `users`, `ON DELETE CASCADE`.
-- `admins` — admin grants. Records who granted it, when, and whether the row is the default admin. A partial unique index allows at most one `is_default = true`.
-- `last_active` — last-seen timestamp per user.
+- **Users & auth** — `users` (UUIDv7-keyed profiles), `credentials` (Argon2id hash, 1:1, `ON DELETE CASCADE`), `admins` (grants, with a partial unique index allowing one default admin), `last_active`.
+- **Rooms** — `rooms` (visibility flags), `memberships` (multi-owner, plus each member's read watermark), `room_invites`, `room_join_requests`.
+- **Messages** — `messages` (sender preserved by id or username snapshot), `message_attachments` + `message_attachment_chunks` (chunked bytes, verified on completion), `message_reactions`.
 
-User deletion cascades to credentials and the admin grant.
-
-`rooms`, `memberships`, and `messages` tables exist for the chat domain but the handlers are not yet implemented.
+Deleting a user cascades to credentials, admin grant, and memberships but preserves their messages via a username snapshot; deleting a room cascades to everything beneath it. For the full table catalog, keys, and invariants, see [`docs/reference/data-model.md`](docs/reference/data-model.md).
 
 ## What's implemented
 
 - WebSocket lifecycle, tagged JSON protocol, graceful shutdown
-- Per-IP rate limiting via `tower_governor` (configurable steady-state and burst)
+- Per-IP rate limiting via `tower_governor` (configurable steady-state and burst), plus per-session message and chunk limits
 - DB-backed user accounts with Argon2id password verification
 - User CRUD: create (open-signup or admin-gated), look up, edit profile, delete, self password update, admin password reset
 - Admin model: bootstrap default admin, promote, demote, default-admin protection
+- Rooms: visibility (public/discoverable), multi-owner membership, rename, public join/leave, request-to-join with approve/reject, invite with accept/decline
+- Messaging: send, paginated history (newest-first keyset), reactions
+- Attachments: resumable chunked upload/download with size + SHA-256 verification
+- Real-time fan-out: live message delivery to connected room members, with dynamic and cross-session subscription and a lossy-with-resync delivery model
+- Read state: per-room read watermark, mark-read, and unread counts
+- Time-based reaper: ages out old messages, empty rooms, stale invites/requests, and abandoned uploads
+- Admin server lifecycle: in-app restart and shutdown, via a supervisor loop that re-initializes a fresh server pass without dropping the listen port
 - Integration tests against real Postgres via `sqlx::test`
 
 ## Roadmap
 
+- **Structured logging and tracing** — replace `println!` and the `// TODO - Logging` markers throughout the actors and session paths with structured events.
 - **TLS enforcement** — harden the release configuration so plain-text listeners can't be misconfigured.
-- **Rooms and messaging** — implement room create/join/leave and persistent message delivery on the existing schema.
-- **Structured logging and tracing** — replace `println!` and `// TODO - Logging` markers with structured events.
+- **A first-party client** — the server ships only a minimal browser test page; a real client would exercise the [client contract](docs/client-contract.md) end to end.
 
 ## Running locally
 

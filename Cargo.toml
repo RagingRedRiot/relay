@@ -17,8 +17,10 @@ governor = "0.10.4"
 reqwest = "0.13.2"
 serde = "1.0.228"
 serde_json = "1.0.149"
+sha2 = "0.10.8"
 sqlx = {version = "0.8.6", features = ["runtime-tokio-native-tls", "postgres", "macros", "migrate", "uuid", "chrono", "json"] }
 tokio = { version = "1.51.0", features = ["full"] }
+tokio-stream = { version = "0.1.17", features = ["sync"] }
 tokio-tungstenite = "0.29.0"
 tokio-util = "0.7.18"
 tower-http = { version = "0.6.8", features = ["fs", "trace"] }

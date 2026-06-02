@@ -12,14 +12,68 @@ pub enum ClientCommand {
     Echo {
         string: String,
     },
-    // TODO: redesign once rooms exist. Client should target a room
-    // (room_id) and send content; the sender is the authenticated user,
-    // not something the client supplies.
-    Message {
-        user_id: Uuid,
+    // Post a message to a room. The sender is the authenticated user (taken
+    // server-side), never supplied by the client. `attachments` declares zero or
+    // more files whose bytes follow as binary chunk frames, each keyed by an
+    // attachment_id the server hands back in MessageCreated.
+    SendMessage {
         room_id: Uuid,
-        value: String,
+        content: String,
+        #[serde(default)]
+        attachments: Vec<NewMessageAttachment>,
     },
+    // Download one attachment's bytes. The server streams the chunks back as
+    // binary frames (same framing as upload) in seq order, terminated by
+    // AttachmentEnd. Read access requires membership of the attachment's room;
+    // a forbidden, missing, or still-incomplete attachment all yield the same
+    // generic error so nothing leaks.
+    DownloadAttachment {
+        attachment_id: Uuid,
+    },
+    // Ask the server the largest chunk payload it will accept per upload frame.
+    // Answered with MaxChunkSize. A client should query this once after auth and
+    // size its chunks at or below the reported value; a larger chunk is dropped by
+    // the transport (the connection is closed), not rejected with an error.
+    GetMaxChunkSize,
+    // React to a message with an emoji. The reactor is the authenticated session
+    // user, taken server-side -- only the target message and emoji come from the
+    // client. Idempotent: re-adding an emoji the caller already reacted with is a
+    // no-op success. Only members of the message's room may react; a forbidden or
+    // missing message yields the same generic failure, so neither leaks.
+    AddReaction {
+        message_id: Uuid,
+        emoji: String,
+    },
+    // Remove the caller's own reaction. Idempotent: removing one that isn't there
+    // is a no-op success. Same membership gate and generic failure as AddReaction.
+    RemoveReaction {
+        message_id: Uuid,
+        emoji: String,
+    },
+    // Page through a room's message history, newest first, each message carrying
+    // its attachment metadata and reaction summary. Read access requires
+    // membership of the room; a non-member and an unknown room yield the same
+    // generic failure, so neither leaks. `before` is a keyset cursor: when set,
+    // only messages older than that message_id are returned, so a client loads the
+    // latest page first, then walks backwards by passing the oldest id it has seen.
+    // `limit` is clamped server-side to a sane maximum.
+    GetMessages {
+        room_name: String,
+        #[serde(default)]
+        before: Option<Uuid>,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    // Advance the caller's read position in a room to `up_to_message_id`. Forward
+    // only: a cursor at or behind the current watermark is an idempotent no-op.
+    // Membership-gated with the same generic failure as GetMessages.
+    MarkRead {
+        room_name: String,
+        up_to_message_id: Uuid,
+    },
+    // Unread message counts for every room the caller belongs to, for room-list
+    // badges. Answered with UnreadSummary.
+    GetUnreadSummary,
     NewUser {
         username: String,
         password: Password,
@@ -104,6 +158,14 @@ pub enum ClientCommand {
     DeclineInvite {
         room_name: String,
     },
+    // Restart the entire server process: drain every connection and actor, then
+    // re-initialize from a fresh config. Admin only. The issuing connection is torn
+    // down with the rest, so the client should expect its socket to close shortly
+    // after the Success ack.
+    RestartServer,
+    // Shut the entire server process down. Admin only. The socket closes as the
+    // process exits.
+    ShutdownServer,
     Close,
     Error {
         error: String,
@@ -117,13 +179,66 @@ pub enum ServerEvent {
     Echo {
         string: String,
     },
-    // TODO: redesign once rooms and user details exist. Should carry
-    // room context and sender details (display name, etc.) rather than
-    // a raw internal user_id. Raw user_id stays server-side.
-    Message {
-        user_id: Uuid,
-        room_id: Uuid,
-        value: String,
+    // A SendMessage was persisted. `message_id` identifies the new message and
+    // `attachment_ids` are returned in declaration order so the client can key each
+    // file's chunk stream. `message` is the full canonical form (timestamp, sender
+    // display name, attachment summaries) -- the same shape that arrives live as
+    // NewMessage, so the sender can render its own message identically and dedup
+    // the live echo by message_id rather than synthesizing it from the ack.
+    MessageCreated {
+        message_id: Uuid,
+        attachment_ids: Vec<Uuid>,
+        message: MessageHistoryItem,
+    },
+    AttachmentComplete {
+        attachment_id: Uuid,
+    },
+    // Reply to GetMaxChunkSize: the largest chunk payload (file bytes, excluding
+    // the frame header) the server will accept in one upload frame.
+    MaxChunkSize {
+        bytes: usize,
+    },
+    // One chunk of a download, streamed back in seq order. The sender task emits
+    // this as a BINARY frame -- [attachment_id 16B][seq u32 BE 4B][payload] -- and
+    // never JSON-serializes it, so the bytes don't pay base64/array inflation on
+    // the hot path.
+    AttachmentChunk {
+        attachment_id: Uuid,
+        seq: i32,
+        data: Vec<u8>,
+    },
+    // Terminates a successful download: every chunk for attachment_id has been
+    // sent. The client uses it to know the stream finished cleanly.
+    AttachmentEnd {
+        attachment_id: Uuid,
+    },
+    // Reply to GetMessages: one page of a room's history, newest first. `messages`
+    // is empty when the room has none in range (or the cursor is past the start).
+    // The sender is identified by display username only -- raw user_ids never go
+    // over the wire -- and falls back to the snapshot taken when a since-deleted
+    // sender's account was removed.
+    MessageHistory {
+        room_name: String,
+        messages: Vec<MessageHistoryItem>,
+    },
+    // Reply to GetUnreadSummary: one entry per room the caller is in, including
+    // rooms with zero unread, so a client can render the full room list.
+    UnreadSummary {
+        rooms: Vec<RoomUnread>,
+    },
+    // A message was posted to a room the caller is subscribed to, pushed live. Same
+    // payload shape as a MessageHistory item so live and backlog render through one
+    // path. The caller may receive this for their own message too (they dedup by
+    // message_id against the MessageCreated ack).
+    NewMessage {
+        room_name: String,
+        message: MessageHistoryItem,
+    },
+    // The session fell behind a room's live buffer and dropped events. Not an
+    // error -- a hint to re-fetch that room from history (GetMessages); the read
+    // watermark keeps the unread count correct meanwhile.
+    Resync {
+        room_name: String,
     },
     Close {
         reason: String,
@@ -312,6 +427,117 @@ pub struct MessageWithUser {
     pub sender: User,
     pub content: String,
     pub timestamp: DateTime<Utc>,
+}
+
+// One message as returned by GetMessages: the row plus its attachments and a
+// per-emoji reaction summary. `sender_username` is the display name (current
+// username, or the snapshot if the sender was deleted) -- the raw sender user_id
+// is never serialized.
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+pub struct MessageHistoryItem {
+    pub message_id: Uuid,
+    pub sender_username: String,
+    pub content: String,
+    pub timestamp: DateTime<Utc>,
+    pub attachments: Vec<AttachmentSummary>,
+    pub reactions: Vec<ReactionSummary>,
+}
+
+// An attachment as shown in history: enough for a client to decide whether and how
+// to download it. `is_complete` is false while an upload is still in flight; the
+// bytes are fetched separately via DownloadAttachment using attachment_id.
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+pub struct AttachmentSummary {
+    pub attachment_id: Uuid,
+    pub filename: String,
+    pub content_type: String,
+    pub size_bytes: i64,
+    pub is_complete: bool,
+}
+
+// One room's unread tally for the caller: messages newer than their read
+// watermark. Zero for a fully-read room (such rooms are still listed).
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+pub struct RoomUnread {
+    pub room_name: String,
+    pub unread: i64,
+}
+
+// One emoji's reaction tally on a message: how many users reacted with it and
+// whether the requesting caller is one of them (so a client can render its own
+// reactions as toggled without a second round trip).
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+pub struct ReactionSummary {
+    pub emoji: String,
+    pub count: i64,
+    pub reacted_by_me: bool,
+}
+
+// Client-sourced metadata for one attachment, supplied in the same command as the
+// message. Enough to create the attachment row up front (is_complete = false) and
+// validate the chunk stream against it; the bytes follow as chunks keyed by the
+// attachment_id the server returns. The parent message_id is assigned server-side
+// when the message is inserted, so it isn't a field here. content_sha256 is the
+// declared digest of the whole file, re-computed by streaming the chunks in seq
+// order on completion.
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+pub struct NewMessageAttachment {
+    pub filename: String,
+    pub content_type: String,
+    pub size_bytes: i64,
+    pub chunk_count: i32,
+    pub content_sha256: Vec<u8>,
+}
+
+// Persisted attachment. Bytes live in AttachmentChunk rows, not here. is_complete
+// flips true once every seq is present and the streamed hash matches
+// content_sha256. Auth derives from the parent message: only its sender may
+// upload chunks; any room member may read them.
+#[derive(sqlx::FromRow)]
+pub struct MessageAttachment {
+    pub attachment_id: Uuid,
+    pub message_id: Uuid,
+    pub filename: String,
+    pub content_type: String,
+    pub size_bytes: i64,
+    pub chunk_count: i32,
+    pub content_sha256: Vec<u8>,
+    pub is_complete: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+// One chunk on its way in. seq is the client-supplied order index; (attachment_id,
+// seq) is unique, so a re-sent chunk is an idempotent upsert and a stalled upload
+// resumes by filling only the missing seqs.
+pub struct NewAttachmentChunk {
+    pub attachment_id: Uuid,
+    pub seq: i32,
+    pub data: Vec<u8>,
+}
+
+#[derive(sqlx::FromRow)]
+pub struct AttachmentChunk {
+    pub attachment_id: Uuid,
+    pub seq: i32,
+    pub data: Vec<u8>,
+}
+
+// Client-sourced: the authenticated caller reacts to a message with an emoji. The
+// reactor is the session user, supplied server-side, so only the target message
+// and emoji come from the client.
+pub struct NewReaction {
+    pub message_id: Uuid,
+    pub emoji: String,
+}
+
+// Persisted reaction: a (message, user, emoji) triple. One of each emoji per user
+// per message; adding an existing one is a no-op.
+#[derive(sqlx::FromRow)]
+pub struct Reaction {
+    pub message_id: Uuid,
+    pub user_id: Uuid,
+    pub emoji: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(sqlx::FromRow)]
