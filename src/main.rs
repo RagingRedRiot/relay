@@ -17,8 +17,12 @@ async fn main() {
     dotenvy::dotenv().ok();
 
     // Process-once setup. Tracing MUST be initialized exactly once -- it lives
-    // across restarts, and a second init would panic.
-    tracing_subscriber::fmt::init();
+    // across restarts, and a second init would panic. Log settings and the bind
+    // address are process-lifetime (a hot restart never re-reads them), so they
+    // come from this one config read; serve_once re-reads config for everything
+    // that can change across a restart.
+    let startup_config = Config::from_env().expect("invalid config");
+    relay::logging::init(&startup_config.log_level, startup_config.log_format);
 
     // Control plane. Anything inside the app (via `ServerControl` in `AppState`) or
     // the OS-signal task below sends a `ControlSignal` here to drive the process
@@ -38,7 +42,7 @@ async fn main() {
     // A restart never drops the port: in-flight connections queue in the backlog
     // instead of being refused, and there's no rebind race. (Changing the bind
     // address therefore requires a full process restart, not a hot restart.)
-    let bind = Config::from_env().expect("invalid config").bind;
+    let bind = startup_config.bind;
     let listener = std::net::TcpListener::bind(&bind).expect("failed to bind listener");
     listener
         .set_nonblocking(true)
@@ -182,7 +186,7 @@ async fn shutdown_signal() {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => { println!("\nSHUTDOWN REQUESTED!") },
-        _ = terminate => { println!("\nSHUTDOWN REQUESTED!") },
+        _ = ctrl_c => { tracing::info!("received SIGINT (Ctrl-C); shutting down") },
+        _ = terminate => { tracing::info!("received SIGTERM; shutting down") },
     }
 }

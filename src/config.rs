@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+use crate::logging::LogFormat;
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub database_url: String,
@@ -30,6 +32,14 @@ pub struct Config {
     pub max_chunk_bytes: usize,
     pub admin_username: String,
     pub admin_credential: String,
+    // Filter directive used when RUST_LOG is unset (e.g. "info", "relay=debug").
+    // RUST_LOG, when present, always takes precedence.
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+    // Log output format: "pretty" (stdout, default), "json" (stdout, for log
+    // shippers), or "journald" (native systemd journal). See logging::LogFormat.
+    #[serde(default)]
+    pub log_format: LogFormat,
 }
 
 fn default_bind() -> String {
@@ -46,6 +56,9 @@ fn default_retention_days() -> i32 {
 }
 fn default_reap_interval_secs() -> u64 {
     3600
+}
+fn default_log_level() -> String {
+    "info".into()
 }
 fn default_max_chunk_bytes() -> usize {
     // Mirror the framework's own default message size so an unconfigured server

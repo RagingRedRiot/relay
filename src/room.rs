@@ -472,11 +472,14 @@ async fn handle_request(
         } => {
             let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "new_room: begin transaction failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
+
+            // Captured for the audit log below; room_name is consumed by the insert.
+            let room_name_for_log = room_name.clone();
 
             // Create the room with the requested visibility
             let room_id: Uuid = match sqlx::query(
@@ -492,23 +495,25 @@ async fn handle_request(
             {
                 Ok(Some(row)) => match row.try_get("room_id") {
                     Ok(room_id) => room_id,
-                    Err(_e) => {
-                        // TODO - Logging
+                    Err(e) => {
+                        tracing::error!(error = %e, "new_room: room_id column read failed");
                         return (RoomResponse::Failed, tx);
                     }
                 },
                 Ok(None) => {
-                    // TODO - Logging
+                    tracing::error!("new_room: insert returned no row");
                     return (RoomResponse::Failed, tx);
                 }
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    // Commonly a unique-violation (room name already taken), a client
+                    // error rather than a server fault -- warn rather than error.
+                    tracing::warn!(error = %e, "new_room: room insert failed (e.g. duplicate name)");
                     return (RoomResponse::Failed, tx);
                 }
             };
 
             // Seed the creator as the room's first member and owner
-            if let Err(_e) = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "INSERT INTO memberships (room_id, user_id, is_owner) VALUES ($1, $2, true)",
             )
             .bind(room_id)
@@ -516,14 +521,17 @@ async fn handle_request(
             .execute(&mut *db)
             .await
             {
-                // TODO - Logging
+                tracing::error!(error = %e, %room_id, "new_room: owner membership insert failed");
                 return (RoomResponse::Failed, tx);
             }
 
             match db.commit().await {
-                Ok(_) => (RoomResponse::RoomCreated { room_id }, tx),
-                Err(_e) => {
-                    // TODO - Logging
+                Ok(_) => {
+                    tracing::info!(target: crate::logging::AUDIT, actor = %source_user_id, room = %room_name_for_log, %room_id, "room created");
+                    (RoomResponse::RoomCreated { room_id }, tx)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, %room_id, "new_room: commit failed");
                     (RoomResponse::Failed, tx)
                 }
             }
@@ -537,24 +545,33 @@ async fn handle_request(
         } => {
             let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "add_room_owner: begin transaction failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
+
+            // Captured for audit/denial logs; new_owner_username is consumed below.
+            let new_owner_for_log = new_owner_username.clone();
 
             // Authorize: caller must own the room (or be an admin). "No such
             // room" and "not authorized" both return Failed so existence isn't
             // leaked.
             let (room_id, authorized) = match gate_room(&mut db, source_user_id, &room_name).await {
                 Ok(Some(gate)) => gate,
-                Ok(None) | Err(_) => {
-                    // TODO - Logging
+                // No such room: existence-hidden, not a fault.
+                Ok(None) => {
+                    tracing::debug!(room = %room_name, "add_room_owner: no such room");
+                    return (RoomResponse::Failed, tx);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "add_room_owner: room authorization lookup failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
 
             if !authorized {
+                tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, room = %room_name, "add_room_owner denied: caller is not an owner or admin");
                 return (RoomResponse::Failed, tx);
             }
 
@@ -569,12 +586,12 @@ async fn handle_request(
                 Ok(maybe_user_id) => match maybe_user_id {
                     Some(row) => row,
                     None => {
-                        // TODO - Logging
+                        tracing::debug!(target = %new_owner_for_log, "add_room_owner: target user not found");
                         return (RoomResponse::Failed, tx);
                     }
                 },
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "add_room_owner: target user lookup failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -583,8 +600,8 @@ async fn handle_request(
 
             let user_id = match maybe_user_id {
                 Ok(user_id) => user_id,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "add_room_owner: user_id column read failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -605,8 +622,8 @@ async fn handle_request(
             .await
             {
                 Ok(maybe) => maybe,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %room_id, "add_room_owner: ownership lookup failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -614,7 +631,7 @@ async fn handle_request(
             match already_owner {
                 None => {
                     // Targeted user is not a member of the room
-                    // TODO - Logging
+                    tracing::debug!(%room_id, target = %new_owner_for_log, "add_room_owner: target is not a member");
                     (RoomResponse::Failed, tx)
                 }
                 Some(true) => {
@@ -623,7 +640,7 @@ async fn handle_request(
                 }
                 Some(false) => {
                     // Member but not yet an owner
-                    if let Err(_e) = sqlx::query(
+                    if let Err(e) = sqlx::query(
                         "UPDATE memberships SET is_owner = true
                             WHERE room_id = $1 AND user_id = $2",
                     )
@@ -632,14 +649,17 @@ async fn handle_request(
                     .execute(&mut *db)
                     .await
                     {
-                        // TODO - Logging
+                        tracing::error!(error = %e, %room_id, "add_room_owner: ownership grant failed");
                         return (RoomResponse::Failed, tx);
                     }
 
                     match db.commit().await {
-                        Ok(_) => (RoomResponse::Success, tx),
-                        Err(_e) => {
-                            // TODO - Logging
+                        Ok(_) => {
+                            tracing::info!(target: crate::logging::AUDIT, actor = %source_user_id, room = %room_name, target = %new_owner_for_log, %room_id, "room owner added");
+                            (RoomResponse::Success, tx)
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, %room_id, "add_room_owner: commit failed");
                             (RoomResponse::Failed, tx)
                         }
                     }
@@ -655,48 +675,63 @@ async fn handle_request(
         } => {
             let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "set_room_name: begin transaction failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
 
+            // Captured for the audit log; new_name is consumed by the update.
+            let new_name_for_log = new_name.clone();
+
             // Authorize: caller must own the room (or be an admin). "No such
             // room" and "not authorized" both return Failed so existence isn't
             // leaked.
-            let (room_id, authorized) =
-                match gate_room(&mut db, source_user_id, &current_name).await {
-                    Ok(Some(gate)) => gate,
-                    Ok(None) | Err(_) => {
-                        // TODO - Logging
-                        return (RoomResponse::Failed, tx);
-                    }
-                };
+            let (room_id, authorized) = match gate_room(&mut db, source_user_id, &current_name)
+                .await
+            {
+                Ok(Some(gate)) => gate,
+                // No such room: existence-hidden, not a fault.
+                Ok(None) => {
+                    tracing::debug!(room = %current_name, "set_room_name: no such room");
+                    return (RoomResponse::Failed, tx);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "set_room_name: room authorization lookup failed");
+                    return (RoomResponse::Failed, tx);
+                }
+            };
 
             if !authorized {
+                tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, room = %current_name, "set_room_name denied: caller is not an owner or admin");
                 return (RoomResponse::Failed, tx);
             }
 
             // Update the room's name to the new name
-            let result =
-                match sqlx::query("UPDATE rooms SET room_name = trim_ws($1) WHERE room_id = $2")
-                    .bind(new_name)
-                    .bind(room_id)
-                    .execute(&mut *db)
-                    .await
-                {
-                    Ok(res) => res,
-                    Err(_e) => {
-                        // TODO - Logging
-                        return (RoomResponse::Failed, tx);
-                    }
-                };
+            let result = match sqlx::query(
+                "UPDATE rooms SET room_name = trim_ws($1) WHERE room_id = $2",
+            )
+            .bind(new_name)
+            .bind(room_id)
+            .execute(&mut *db)
+            .await
+            {
+                Ok(res) => res,
+                Err(e) => {
+                    // Commonly a unique-violation (new name already taken).
+                    tracing::warn!(error = %e, %room_id, "set_room_name: rename failed (e.g. duplicate name)");
+                    return (RoomResponse::Failed, tx);
+                }
+            };
 
             match result.rows_affected() {
                 1 => match db.commit().await {
-                    Ok(_) => (RoomResponse::Success, tx),
-                    Err(_e) => {
-                        // TODO - Logging
+                    Ok(_) => {
+                        tracing::info!(target: crate::logging::AUDIT, actor = %source_user_id, room = %current_name, new_name = %new_name_for_log, %room_id, "room renamed");
+                        (RoomResponse::Success, tx)
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, %room_id, "set_room_name: commit failed");
                         (RoomResponse::Failed, tx)
                     }
                 },
@@ -712,8 +747,8 @@ async fn handle_request(
         } => {
             let mut db = match pool.acquire().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "get_room: acquire connection failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -727,8 +762,8 @@ async fn handle_request(
             .await
             {
                 Ok(maybe_room) => maybe_room,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "get_room: room lookup failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -752,8 +787,8 @@ async fn handle_request(
                 .await
                 {
                     Ok(visible) => visible,
-                    Err(_e) => {
-                        // TODO - Logging
+                    Err(e) => {
+                        tracing::error!(error = %e, room_id = %room.room_id, "get_room: visibility check failed");
                         return (RoomResponse::Failed, tx);
                     }
                 };
@@ -780,8 +815,8 @@ async fn handle_request(
         } => {
             let mut db = match pool.acquire().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "get_room_membership: acquire connection failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -797,8 +832,8 @@ async fn handle_request(
             .await
             {
                 Ok(maybe_room) => maybe_room,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "get_room_membership: room lookup failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -822,8 +857,8 @@ async fn handle_request(
                 .await
                 {
                     Ok(visible) => visible,
-                    Err(_e) => {
-                        // TODO - Logging
+                    Err(e) => {
+                        tracing::error!(error = %e, room_id = %room.room_id, "get_room_membership: visibility check failed");
                         return (RoomResponse::Failed, tx);
                     }
                 };
@@ -845,8 +880,8 @@ async fn handle_request(
             .await
             {
                 Ok(users) => users,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, room_id = %room.room_id, "get_room_membership: member list query failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -861,8 +896,8 @@ async fn handle_request(
         } => {
             let mut db = match pool.acquire().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "join_room: acquire connection failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -877,8 +912,8 @@ async fn handle_request(
             .await
             {
                 Ok(maybe_room) => maybe_room,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "join_room: room lookup failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -905,8 +940,8 @@ async fn handle_request(
                 .await
                 {
                     Ok(res) => res,
-                    Err(_e) => {
-                        // TODO - Logging
+                    Err(e) => {
+                        tracing::error!(error = %e, room_id = %room.room_id, "join_room: membership insert failed");
                         return (RoomResponse::Failed, tx);
                     }
                 };
@@ -935,8 +970,8 @@ async fn handle_request(
                 .await
                 {
                     Ok(res) => res,
-                    Err(_e) => {
-                        // TODO - Logging
+                    Err(e) => {
+                        tracing::error!(error = %e, room_id = %room.room_id, "join_room: join request insert failed");
                         return (RoomResponse::Failed, tx);
                     }
                 };
@@ -960,8 +995,8 @@ async fn handle_request(
         } => {
             let mut db = match pool.acquire().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "leave_room: acquire connection failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -981,8 +1016,8 @@ async fn handle_request(
             .await
             {
                 Ok(res) => res,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "leave_room: membership delete failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -997,8 +1032,8 @@ async fn handle_request(
         RoomRequest::GetMyJoinRequests { source_user_id, tx } => {
             let mut db = match pool.acquire().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "get_my_join_requests: acquire connection failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -1016,8 +1051,8 @@ async fn handle_request(
             .await
             {
                 Ok(rooms) => rooms,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "get_my_join_requests: query failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -1028,8 +1063,8 @@ async fn handle_request(
         RoomRequest::GetIncomingJoinRequests { source_user_id, tx } => {
             let mut db = match pool.acquire().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "get_incoming_join_requests: acquire connection failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -1051,8 +1086,8 @@ async fn handle_request(
             .await
             {
                 Ok(requests) => requests,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "get_incoming_join_requests: query failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -1068,24 +1103,33 @@ async fn handle_request(
         } => {
             let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "approve_join_request: begin transaction failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
+
+            // Captured for audit/denial logs; requester_username is consumed below.
+            let requester_for_log = requester_username.clone();
 
             // Authorize: caller must own the room (or be an admin). "No such
             // room" and "not authorized" both return Failed so existence isn't
             // leaked.
             let (room_id, authorized) = match gate_room(&mut db, source_user_id, &room_name).await {
                 Ok(Some(gate)) => gate,
-                Ok(None) | Err(_) => {
-                    // TODO - Logging
+                // No such room: existence-hidden, not a fault.
+                Ok(None) => {
+                    tracing::debug!(room = %room_name, "approve_join_request: no such room");
+                    return (RoomResponse::Failed, tx);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "approve_join_request: room authorization lookup failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
 
             if !authorized {
+                tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, room = %room_name, "approve_join_request denied: caller is not an owner or admin");
                 return (RoomResponse::Failed, tx);
             }
 
@@ -1104,8 +1148,8 @@ async fn handle_request(
             .await
             {
                 Ok(maybe_id) => maybe_id,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %room_id, "approve_join_request: request delete failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -1117,7 +1161,7 @@ async fn handle_request(
             // Admit the requester. ON CONFLICT DO NOTHING in case they became a
             // member by some other path in the meantime.
             // Start caught up: watermark = newest message at admission time.
-            if let Err(_e) = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "INSERT INTO memberships (room_id, user_id, last_read_message_id)
                     VALUES ($1, $2,
                             (SELECT message_id FROM messages
@@ -1129,7 +1173,7 @@ async fn handle_request(
             .execute(&mut *db)
             .await
             {
-                // TODO - Logging
+                tracing::error!(error = %e, %room_id, %approved_user_id, "approve_join_request: membership insert failed");
                 return (RoomResponse::Failed, tx);
             }
 
@@ -1142,14 +1186,15 @@ async fn handle_request(
             .await
             {
                 Ok(name) => name,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %room_id, "approve_join_request: canonical name lookup failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
 
             match db.commit().await {
                 Ok(_) => {
+                    tracing::info!(target: crate::logging::AUDIT, actor = %source_user_id, room = %room_name, target = %requester_for_log, %approved_user_id, %room_id, "join request approved");
                     // Cross-session: the admitted user isn't the caller. If any of
                     // their sessions are online, subscribe those sessions to the
                     // room's live stream now, so they get messages without
@@ -1157,8 +1202,8 @@ async fn handle_request(
                     hub.subscribe_user_to_room(approved_user_id, room_id, room_name);
                     (RoomResponse::Success, tx)
                 }
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %room_id, "approve_join_request: commit failed");
                     (RoomResponse::Failed, tx)
                 }
             }
@@ -1172,11 +1217,15 @@ async fn handle_request(
         } => {
             let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "reject_join_request: begin transaction failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
+
+            // Captured for audit/denial logs; both are consumed by the queries below.
+            let room_for_log = room_name.clone();
+            let requester_for_log = requester_username.clone();
 
             // Authorize: caller must own the room (or be an admin).
             let gate = match sqlx::query_as::<_, (Uuid, bool)>(
@@ -1195,8 +1244,8 @@ async fn handle_request(
             .await
             {
                 Ok(gate) => gate,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "reject_join_request: room authorization lookup failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -1204,9 +1253,11 @@ async fn handle_request(
             // Treat "no such room" and "not authorized" identically, so a
             // non-owner can't probe a private room's existence here.
             let Some((room_id, authorized)) = gate else {
+                tracing::debug!(room = %room_for_log, "reject_join_request: no such room");
                 return (RoomResponse::Failed, tx);
             };
             if !authorized {
+                tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, room = %room_for_log, "reject_join_request denied: caller is not an owner or admin");
                 return (RoomResponse::Failed, tx);
             }
 
@@ -1223,8 +1274,8 @@ async fn handle_request(
             .await
             {
                 Ok(res) => res,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %room_id, "reject_join_request: request delete failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -1232,9 +1283,12 @@ async fn handle_request(
             match result.rows_affected() {
                 0 => (RoomResponse::NoChange, tx),
                 _ => match db.commit().await {
-                    Ok(_) => (RoomResponse::Success, tx),
-                    Err(_e) => {
-                        // TODO - Logging
+                    Ok(_) => {
+                        tracing::info!(target: crate::logging::AUDIT, actor = %source_user_id, room = %room_for_log, target = %requester_for_log, %room_id, "join request rejected");
+                        (RoomResponse::Success, tx)
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, %room_id, "reject_join_request: commit failed");
                         (RoomResponse::Failed, tx)
                     }
                 },
@@ -1249,23 +1303,32 @@ async fn handle_request(
         } => {
             let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "invite_to_room: begin transaction failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
+
+            // Captured for audit/denial logs; invitee_username is consumed below.
+            let invitee_for_log = invitee_username.clone();
 
             // Authorize: only an owner (or admin) may invite. Missing room and
             // not-authorized both return Failed so existence isn't leaked.
             let (room_id, authorized) = match gate_room(&mut db, source_user_id, &room_name).await {
                 Ok(Some(gate)) => gate,
-                Ok(None) | Err(_) => {
-                    // TODO - Logging
+                // No such room: existence-hidden, not a fault.
+                Ok(None) => {
+                    tracing::debug!(room = %room_name, "invite_to_room: no such room");
+                    return (RoomResponse::Failed, tx);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "invite_to_room: room authorization lookup failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
 
             if !authorized {
+                tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, room = %room_name, "invite_to_room denied: caller is not an owner or admin");
                 return (RoomResponse::Failed, tx);
             }
 
@@ -1278,13 +1341,14 @@ async fn handle_request(
             .await
             {
                 Ok(maybe_id) => maybe_id,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "invite_to_room: invitee lookup failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
 
             let Some(invitee_id) = invitee_id else {
+                tracing::debug!(target = %invitee_for_log, "invite_to_room: invitee not found");
                 return (RoomResponse::Failed, tx);
             };
 
@@ -1306,17 +1370,20 @@ async fn handle_request(
             .await
             {
                 Ok(res) => res,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %room_id, %invitee_id, "invite_to_room: invite insert failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
 
             match result.rows_affected() {
                 1 => match db.commit().await {
-                    Ok(_) => (RoomResponse::Success, tx),
-                    Err(_e) => {
-                        // TODO - Logging
+                    Ok(_) => {
+                        tracing::info!(target: crate::logging::AUDIT, actor = %source_user_id, room = %room_name, target = %invitee_for_log, %invitee_id, %room_id, "user invited to room");
+                        (RoomResponse::Success, tx)
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, %room_id, "invite_to_room: commit failed");
                         (RoomResponse::Failed, tx)
                     }
                 },
@@ -1328,8 +1395,8 @@ async fn handle_request(
         RoomRequest::GetMyInvites { source_user_id, tx } => {
             let mut db = match pool.acquire().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "get_my_invites: acquire connection failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -1347,8 +1414,8 @@ async fn handle_request(
             .await
             {
                 Ok(rooms) => rooms,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "get_my_invites: query failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -1363,8 +1430,8 @@ async fn handle_request(
         } => {
             let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "accept_invite: begin transaction failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -1384,8 +1451,8 @@ async fn handle_request(
             .await
             {
                 Ok(maybe_id) => maybe_id,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "accept_invite: invite consume failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -1397,7 +1464,7 @@ async fn handle_request(
             // Join the room. ON CONFLICT DO NOTHING in case membership already
             // exists by some other path.
             // Start caught up: watermark = newest message at accept time.
-            if let Err(_e) = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "INSERT INTO memberships (room_id, user_id, last_read_message_id)
                     VALUES ($1, $2,
                             (SELECT message_id FROM messages
@@ -1409,14 +1476,14 @@ async fn handle_request(
             .execute(&mut *db)
             .await
             {
-                // TODO - Logging
+                tracing::error!(error = %e, %room_id, "accept_invite: membership insert failed");
                 return (RoomResponse::Failed, tx);
             }
 
             match db.commit().await {
                 Ok(_) => (RoomResponse::Success, tx),
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %room_id, "accept_invite: commit failed");
                     (RoomResponse::Failed, tx)
                 }
             }
@@ -1429,8 +1496,8 @@ async fn handle_request(
         } => {
             let mut db = match pool.acquire().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "decline_invite: acquire connection failed");
                     return (RoomResponse::Failed, tx);
                 }
             };
@@ -1448,8 +1515,8 @@ async fn handle_request(
             .await
             {
                 Ok(res) => res,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "decline_invite: invite delete failed");
                     return (RoomResponse::Failed, tx);
                 }
             };

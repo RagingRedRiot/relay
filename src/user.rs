@@ -186,7 +186,7 @@ impl UserHandle {
             .await
             .is_err()
         {
-            // TODO - Logging
+            tracing::error!("user actor unavailable: get_user_by_username request dropped");
             return UserResponse::Failed;
         }
 
@@ -322,32 +322,41 @@ async fn handle_request(
         } => {
             let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "new_user: begin transaction failed");
                     return (UserResponse::Failed, tx);
                 }
             };
 
             let hash = match generate_hash(credential) {
                 Ok(hash) => hash,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "new_user: password hashing failed");
                     return (UserResponse::Failed, tx);
                 }
             };
 
+            // Captured for the audit log below; create_user consumes `user`.
+            let username = user.username.clone();
             let user_id = match create_user(&mut db, user, &hash).await {
                 Ok(user_id) => user_id,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    // Commonly a unique-violation (username already taken), which is
+                    // a client error, not a server fault -- warn rather than error.
+                    tracing::warn!(error = %e, "new_user: user insert failed (e.g. duplicate username)");
                     return (UserResponse::Failed, tx);
                 }
             };
 
             match db.commit().await {
-                Ok(_) => (UserResponse::UserCreated { user_id }, tx),
-                Err(_e) => {
-                    // TODO - Logging
+                Ok(_) => {
+                    // Single audit point for account creation -- covers both the open
+                    // signup and authenticated-creation paths that reach this actor.
+                    tracing::info!(target: crate::logging::AUDIT, %user_id, username = %username, "account created");
+                    (UserResponse::UserCreated { user_id }, tx)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, %user_id, "new_user: commit failed");
                     (UserResponse::Failed, tx)
                 }
             }
@@ -363,8 +372,8 @@ async fn handle_request(
                     Some(user) => user,
                     None => return (UserResponse::NoUserExists, tx),
                 },
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %user_id, "get_user_info: query failed");
                     return (UserResponse::Failed, tx);
                 }
             };
@@ -374,16 +383,16 @@ async fn handle_request(
         UserRequest::IsAdminRequest { user_id, tx } => {
             let mut db = match pool.acquire().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "is_admin: acquire connection failed");
                     return (UserResponse::Failed, tx);
                 }
             };
 
             match is_admin(&mut db, user_id).await {
                 Ok(value) => (UserResponse::IsAdmin { is_admin: value }, tx),
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %user_id, "is_admin: query failed");
                     (UserResponse::Failed, tx)
                 }
             }
@@ -400,8 +409,8 @@ async fn handle_request(
         } => {
             let mut db = match pool.acquire().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "edit_user: acquire connection failed");
                     return (UserResponse::Failed, tx);
                 }
             };
@@ -420,8 +429,8 @@ async fn handle_request(
             .await
             {
                 Ok(res) => (res, tx),
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, actor = %source_user_id, target = %target_username, "edit_user: query failed");
                     (UserResponse::Failed, tx)
                 }
             }
@@ -430,16 +439,16 @@ async fn handle_request(
         UserRequest::GetUserByUsername { username, tx } => {
             let mut db = match pool.acquire().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "get_user_by_username: acquire connection failed");
                     return (UserResponse::Failed, tx);
                 }
             };
 
             match get_user_by_username(&mut db, &username).await {
                 Ok(res) => (res, tx),
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "get_user_by_username: query failed");
                     (UserResponse::Failed, tx)
                 }
             }
@@ -452,8 +461,8 @@ async fn handle_request(
         } => {
             let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "delete_user: begin transaction failed");
                     return (UserResponse::Failed, tx);
                 }
             };
@@ -471,23 +480,23 @@ async fn handle_request(
             // Check if source user is admin
             let is_admin: bool = match is_admin(&mut db, source_user_id).await {
                 Ok(maybe_admin) => maybe_admin,
-                Err(_) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "delete_user: admin check query failed");
                     return (UserResponse::Failed, tx);
                 }
             };
 
             // If the user source is not an admin or targeting itself, fail
             if !is_admin && target_user_id != source_user_id {
-                // TODO - Logging
+                tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, target = %target_username, "delete denied: caller is not an admin and not deleting self");
                 return (UserResponse::Failed, tx);
             }
 
             // Check if the target user is Default Admin
             let maybe_admin: Option<Admin> = match get_admin(&mut db, target_user_id).await {
                 Ok(maybe_admin) => maybe_admin,
-                Err(_) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "delete_user: target admin lookup failed");
                     return (UserResponse::Failed, tx);
                 }
             };
@@ -497,20 +506,22 @@ async fn handle_request(
             };
 
             if is_default {
-                return (UserResponse::Failed, tx); // Don't allow default admin to be deleted, even by admin or itself
+                // Don't allow the default admin to be deleted, even by an admin or itself.
+                tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, target = %target_username, "delete denied: target is the default admin");
+                return (UserResponse::Failed, tx);
             }
 
             // Put a DB lock on the target user's ID
-            if let Err(_e) = sqlx::query("SELECT user_id FROM users WHERE user_id = $1 FOR UPDATE")
+            if let Err(e) = sqlx::query("SELECT user_id FROM users WHERE user_id = $1 FOR UPDATE")
                 .bind(target_user_id)
                 .execute(&mut *db)
                 .await
             {
-                // TODO - Logging
+                tracing::error!(error = %e, %target_user_id, "delete_user: row lock failed");
                 return (UserResponse::Failed, tx);
             }
 
-            if let Err(_e) = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "UPDATE messages set sender_username_snapshot = u.username
                 FROM users u
                 WHERE messages.sender_id = $1 AND u.user_id = $1",
@@ -519,7 +530,7 @@ async fn handle_request(
             .execute(&mut *db)
             .await
             {
-                // TODO - Logging
+                tracing::error!(error = %e, %target_user_id, "delete_user: username snapshot update failed");
                 return (UserResponse::Failed, tx);
             };
 
@@ -536,8 +547,8 @@ async fn handle_request(
                 .await
             {
                 Ok(res) => res.rows_affected() == 1,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %target_user_id, "delete_user: delete failed");
                     false
                 }
             };
@@ -545,12 +556,13 @@ async fn handle_request(
             if !success {
                 return (UserResponse::Failed, tx);
             }
-            if let Err(_e) = db.commit().await {
-                // TODO - Logging
+            if let Err(e) = db.commit().await {
+                tracing::error!(error = %e, %target_user_id, "delete_user: commit failed");
                 return (UserResponse::Failed, tx);
             }
             let is_self = source_user_id == target_user_id;
 
+            tracing::info!(target: crate::logging::AUDIT, actor = %source_user_id, target = %target_username, %target_user_id, is_self, "user deleted");
             (UserResponse::UserDeleted { is_self }, tx)
         }
 
@@ -562,8 +574,8 @@ async fn handle_request(
         } => {
             let mut db = match pool.acquire().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "update_password: acquire connection failed");
                     return (UserResponse::Failed, tx);
                 }
             };
@@ -574,13 +586,13 @@ async fn handle_request(
             let source_is_default = match get_admin(&mut db, source_user_id).await {
                 Ok(Some(admin)) => admin.is_default,
                 Ok(None) => false,
-                Err(_) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "update_password: admin lookup failed");
                     return (UserResponse::Failed, tx);
                 }
             };
             if source_is_default {
-                // TODO - Logging
+                tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, "update_password denied: default admin credentials are config-managed");
                 return (UserResponse::Failed, tx);
             }
 
@@ -591,8 +603,8 @@ async fn handle_request(
                     password: new_password,
                 }) {
                     Ok(hash) => hash,
-                    Err(_e) => {
-                        // TODO - Logging
+                    Err(e) => {
+                        tracing::error!(error = %e, "update_password: password hashing failed");
                         return (UserResponse::Failed, tx);
                     }
                 };
@@ -609,21 +621,23 @@ async fn handle_request(
                 .await
                 {
                     Ok(res) => res,
-                    Err(_e) => {
-                        // TODO - Logging
+                    Err(e) => {
+                        tracing::error!(error = %e, %source_user_id, "update_password: credential update failed");
                         return (UserResponse::Failed, tx);
                     }
                 }
                 .rows_affected();
 
                 if row == 1 {
+                    tracing::info!(target: crate::logging::AUDIT, actor = %source_user_id, "password changed");
                     (UserResponse::Success, tx)
                 } else {
-                    // TODO - Logging
+                    // No credential row matched -- shouldn't happen for a verified user.
+                    tracing::warn!(%source_user_id, "update_password: no credential row updated");
                     (UserResponse::Failed, tx)
                 }
             } else {
-                // TODO - Logging
+                tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, "update_password denied: current password incorrect");
                 (UserResponse::Failed, tx)
             }
         }
@@ -636,8 +650,8 @@ async fn handle_request(
         } => {
             let mut db = match pool.acquire().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "reset_password: acquire connection failed");
                     return (UserResponse::Failed, tx);
                 }
             };
@@ -648,14 +662,15 @@ async fn handle_request(
                         Some(admin) => (true, admin.is_default),
                         None => (false, false),
                     },
-                    Err(_) => {
-                        // TODO - Logging
+                    Err(e) => {
+                        tracing::error!(error = %e, "reset_password: caller admin lookup failed");
                         return (UserResponse::Failed, tx);
                     }
                 };
 
             // Non-admins cannot use ResetPassword
             if !source_is_admin {
+                tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, target = %target_username, "reset_password denied: caller is not an admin");
                 return (UserResponse::Failed, tx);
             }
 
@@ -671,6 +686,7 @@ async fn handle_request(
 
             // Admins can change other user passwords, but not their own
             if target_user_id == source_user_id {
+                tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, "reset_password denied: admin cannot reset own password");
                 return (UserResponse::Failed, tx);
             }
 
@@ -680,14 +696,15 @@ async fn handle_request(
                         Some(admin) => (true, admin.is_default),
                         None => (false, false),
                     },
-                    Err(_) => {
-                        // TODO - Logging
+                    Err(e) => {
+                        tracing::error!(error = %e, "reset_password: target admin lookup failed");
                         return (UserResponse::Failed, tx);
                     }
                 };
 
             // Only the Default Admin can reset the password of admins
             if target_is_admin && !source_is_default || target_is_default {
+                tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, target = %target_username, "reset_password denied: only the default admin may reset an admin's password");
                 return (UserResponse::Failed, tx);
             }
 
@@ -695,8 +712,8 @@ async fn handle_request(
                 password: new_password,
             }) {
                 Ok(hash) => hash,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "reset_password: password hashing failed");
                     return (UserResponse::Failed, tx);
                 }
             };
@@ -713,17 +730,18 @@ async fn handle_request(
             .await
             {
                 Ok(res) => res,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %target_user_id, "reset_password: credential update failed");
                     return (UserResponse::Failed, tx);
                 }
             }
             .rows_affected();
 
             if row == 1 {
+                tracing::info!(target: crate::logging::AUDIT, actor = %source_user_id, target = %target_username, %target_user_id, "password reset");
                 (UserResponse::Success, tx)
             } else {
-                // TODO - Logging
+                tracing::warn!(%target_user_id, "reset_password: no credential row updated");
                 (UserResponse::Failed, tx)
             }
         }
@@ -735,21 +753,22 @@ async fn handle_request(
         } => {
             let mut db = match pool.acquire().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "promote: acquire connection failed");
                     return (UserResponse::Failed, tx);
                 }
             };
 
             let source_is_admin = match is_admin(&mut db, source_user_id).await {
                 Ok(is_admin) => is_admin,
-                Err(_) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "promote: caller admin check failed");
                     return (UserResponse::Failed, tx);
                 }
             };
 
             if !source_is_admin {
+                tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, target = %target_username, "promote denied: caller is not an admin");
                 return (UserResponse::Failed, tx);
             }
 
@@ -774,14 +793,17 @@ async fn handle_request(
             .await
             {
                 Ok(res) => res,
-                Err(_) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %target_user_id, "promote: admin insert failed");
                     return (UserResponse::Failed, tx);
                 }
             };
 
             match result.rows_affected() {
-                1 => (UserResponse::Success, tx),
+                1 => {
+                    tracing::info!(target: crate::logging::AUDIT, actor = %source_user_id, target = %target_username, %target_user_id, "user promoted to admin");
+                    (UserResponse::Success, tx)
+                }
                 0 => (UserResponse::NoChange, tx),
                 _ => unreachable!(),
             }
@@ -794,21 +816,22 @@ async fn handle_request(
         } => {
             let mut db = match pool.acquire().await {
                 Ok(db) => db,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "demote: acquire connection failed");
                     return (UserResponse::Failed, tx);
                 }
             };
 
             let source_is_admin = match is_admin(&mut db, source_user_id).await {
                 Ok(is_admin) => is_admin,
-                Err(_) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, "demote: caller admin check failed");
                     return (UserResponse::Failed, tx);
                 }
             };
 
             if !source_is_admin {
+                tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, target = %target_username, "demote denied: caller is not an admin");
                 return (UserResponse::Failed, tx);
             }
 
@@ -828,8 +851,8 @@ async fn handle_request(
                         Some(admin) => (true, admin.is_default),
                         None => (false, false),
                     },
-                    Err(_) => {
-                        // TODO - Logging
+                    Err(e) => {
+                        tracing::error!(error = %e, "demote: target admin lookup failed");
                         return (UserResponse::Failed, tx);
                     }
                 };
@@ -840,6 +863,7 @@ async fn handle_request(
             }
             // Reject attempts to demote the default admin
             if target_is_default {
+                tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, target = %target_username, "demote denied: target is the default admin");
                 return (UserResponse::Failed, tx);
             }
 
@@ -849,13 +873,14 @@ async fn handle_request(
                 .await
             {
                 Ok(res) => res.rows_affected() == 1,
-                Err(_e) => {
-                    // TODO - Logging
+                Err(e) => {
+                    tracing::error!(error = %e, %target_user_id, "demote: admin delete failed");
                     false
                 }
             };
 
             if success {
+                tracing::info!(target: crate::logging::AUDIT, actor = %source_user_id, target = %target_username, %target_user_id, "user demoted from admin");
                 (UserResponse::Success, tx)
             } else {
                 (UserResponse::Failed, tx)
@@ -907,21 +932,21 @@ async fn edit_user(
 
     // If the target user does not exist, fail
     let Some(target_user_id) = target_user_id else {
-        // TODO - Logging
+        tracing::debug!(target = %target_username, "edit_user: target user not found");
         return Ok(UserResponse::Failed);
     };
 
     // If the user is not modifying itself or the user is not an admin, fail
     if target_user_id != source_user_id && !is_source_admin {
-        // TODO - Logging
+        tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, target = %target_username, "edit denied: caller is not an admin and not editing self");
         return Ok(UserResponse::Failed);
     }
 
     // Check if the target user is Default Admin
     let maybe_admin: Option<Admin> = match get_admin(db, target_user_id).await {
         Ok(maybe_admin) => maybe_admin,
-        Err(_) => {
-            // TODO - Logging
+        Err(e) => {
+            tracing::error!(error = %e, "edit_user: target admin lookup failed");
             return Ok(UserResponse::Failed);
         }
     };
@@ -931,7 +956,9 @@ async fn edit_user(
     };
 
     if is_default {
-        return Ok(UserResponse::Failed); // Don't allow edits to the default admin
+        // Don't allow edits to the default admin.
+        tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, target = %target_username, "edit denied: target is the default admin");
+        return Ok(UserResponse::Failed);
     }
 
     let result = sqlx::query(
@@ -952,10 +979,11 @@ async fn edit_user(
     .rows_affected();
 
     if result == 1 {
+        tracing::info!(target: crate::logging::AUDIT, actor = %source_user_id, target = %target_username, %target_user_id, "user profile edited");
         Ok(UserResponse::Success)
     } else {
-        // Zero rows were changed
-        // TODO - Logging
+        // Zero rows changed -- target vanished between the lookup and the update.
+        tracing::debug!(%target_user_id, "edit_user: no rows updated");
         Ok(UserResponse::Failed)
     }
 }
@@ -1027,7 +1055,7 @@ async fn translate_username_to_id(
     match user_response {
         UserResponse::UserInfo { user_info } => Ok(Some(user_info.user_id)),
         _ => {
-            // TODO - Logging
+            tracing::debug!(username = %username, "translate_username_to_id: no user for username");
             Ok(None)
         }
     }
