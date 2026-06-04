@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::Deserialize;
 
 use crate::logging::LogFormat;
@@ -32,6 +34,10 @@ pub struct Config {
     pub max_chunk_bytes: usize,
     pub admin_username: String,
     pub admin_credential: String,
+    // Override the embedded default frontend by pointing at a directory of static
+    // files. Any path served by the embedded frontend is shadowed by this directory
+    // instead. Unset means the binary's built-in frontend is used.
+    pub frontend_dir: Option<PathBuf>,
     // Filter directive used when RUST_LOG is unset (e.g. "info", "relay=debug").
     // RUST_LOG, when present, always takes precedence.
     #[serde(default = "default_log_level")]
