@@ -222,8 +222,12 @@ async fn upload_then_download_round_trips_bytes(pool: PgPool) {
     authenticate(&mut ws, "alice", "alicepw").await;
 
     // A non-trivial "file" split into uneven chunks: four full 1024B chunks and a
-    // short final one, so the last frame differs in length from the rest.
-    let original: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+    // short final one, so the last frame differs in length from the rest. It opens
+    // with a real PNG signature so the server's content-type policy detects and
+    // accepts it as image/png (the filler bytes include NUL, so it can't pass as
+    // text); the rest is arbitrary, exercising byte-exact round-tripping.
+    let mut original: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    original.extend((0..4992u32).map(|i| (i % 251) as u8));
     let parts: Vec<&[u8]> = original.chunks(1024).collect();
     assert_eq!(parts.len(), 5);
 
@@ -233,17 +237,14 @@ async fn upload_then_download_round_trips_bytes(pool: PgPool) {
     hasher.update(&original);
     let content_sha256 = hasher.finalize().to_vec();
 
-    // Declare the attachment alongside the message and grab the id the chunks key
-    // against.
-    let rid = room_id(&pool, "general").await;
     send_cmd(
         &mut ws,
         &ClientCommand::SendMessage {
-            room_id: rid,
+            room_name: "general".to_owned(),
             content: "with file".to_owned(),
             attachments: vec![NewMessageAttachment {
-                filename: "roundtrip.bin".to_owned(),
-                content_type: "application/octet-stream".to_owned(),
+                filename: "roundtrip.png".to_owned(),
+                content_type: "image/png".to_owned(),
                 size_bytes: original.len() as i64,
                 chunk_count: parts.len() as i32,
                 content_sha256,

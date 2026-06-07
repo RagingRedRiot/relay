@@ -17,7 +17,7 @@ pub enum ClientCommand {
     // more files whose bytes follow as binary chunk frames, each keyed by an
     // attachment_id the server hands back in MessageCreated.
     SendMessage {
-        room_id: Uuid,
+        room_name: String,
         content: String,
         #[serde(default)]
         attachments: Vec<NewMessageAttachment>,
@@ -49,6 +49,15 @@ pub enum ClientCommand {
     RemoveReaction {
         message_id: Uuid,
         emoji: String,
+    },
+    // Permanently remove a message (an "unsend"). Allowed only for the message's
+    // own sender or a server admin; the check is server-side per request. On
+    // success the message -- with any attachments, their chunks, and reactions --
+    // is deleted and a MessageRemoved is fanned out to the room so every client
+    // drops it live. A forbidden or unknown message yields the same generic
+    // failure, so neither the message's existence nor who may delete it leaks.
+    DeleteMessage {
+        message_id: Uuid,
     },
     // Page through a room's message history, newest first, each message carrying
     // its attachment metadata and reaction summary. Read access requires
@@ -83,6 +92,24 @@ pub enum ClientCommand {
     },
     GetUserByUsername {
         username: String,
+    },
+    // Page through the user directory, ordered by username. Open to any
+    // authenticated user (e.g. to find someone to invite without knowing their
+    // exact handle). Answered with `Users`.
+    //
+    // - `starts_with`: optional case-insensitive username prefix filter. Empty or
+    //   whitespace-only is treated as no filter.
+    // - `after`: keyset cursor -- the `username` of the last entry from the
+    //   previous page; the next page continues with usernames ordered after it.
+    //   Omit for the first page.
+    // - `limit`: page size, clamped server-side (defaults applied, hard cap).
+    GetUsers {
+        #[serde(default)]
+        starts_with: Option<String>,
+        #[serde(default)]
+        after: Option<String>,
+        #[serde(default)]
+        limit: Option<u32>,
     },
     EditUser {
         target_username: String,
@@ -133,8 +160,17 @@ pub enum ClientCommand {
     LeaveRoom {
         room_name: String,
     },
+    // Owner/admin removes another user's membership from a room.
+    RemoveRoomMember {
+        room_name: String,
+        member_username: String,
+    },
     // The caller's own outstanding join requests.
     GetMyJoinRequests,
+    // The caller withdraws their own pending join request.
+    CancelJoinRequest {
+        room_name: String,
+    },
     // Pending join requests for rooms the caller owns (or any room, if admin).
     GetIncomingJoinRequests,
     ApproveJoinRequest {
@@ -158,6 +194,16 @@ pub enum ClientCommand {
     DeclineInvite {
         room_name: String,
     },
+    // Whether the server has open (unauthenticated) signups enabled. Valid in the
+    // prelude (before auth) so a client can decide whether to offer registration,
+    // and also after auth. Reply: SignupStatus.
+    GetSignupStatus,
+    // Returns all rooms that are publicly listed (is_discoverable = true or is_public = true),
+    // so a client can show a room browser without knowing room names in advance.
+    ListDiscoverableRooms,
+    // Admin only: returns every room (including private, non-discoverable ones) so
+    // an admin can browse and moderate any room. Non-admins are rejected.
+    ListAllRooms,
     // Restart the entire server process: drain every connection and actor, then
     // re-initialize from a fresh config. Admin only. The issuing connection is torn
     // down with the rest, so the client should expect its socket to close shortly
@@ -174,7 +220,9 @@ pub enum ClientCommand {
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub enum ServerEvent {
-    AuthOk,
+    AuthOk {
+        is_admin: bool,
+    },
     NoAuth,
     Echo {
         string: String,
@@ -193,10 +241,21 @@ pub enum ServerEvent {
     AttachmentComplete {
         attachment_id: Uuid,
     },
+    // A fully-uploaded attachment failed the content-type policy (unsupported
+    // format, or declared type doesn't match the actual bytes) and was not
+    // published. Attachment-specific so the client can attribute it to the file.
+    AttachmentRejected {
+        attachment_id: Uuid,
+        reason: String,
+    },
     // Reply to GetMaxChunkSize: the largest chunk payload (file bytes, excluding
     // the frame header) the server will accept in one upload frame.
     MaxChunkSize {
         bytes: usize,
+    },
+    // Reply to GetSignupStatus: whether unauthenticated account creation is open.
+    SignupStatus {
+        open_signups: bool,
     },
     // One chunk of a download, streamed back in seq order. The sender task emits
     // this as a BINARY frame -- [attachment_id 16B][seq u32 BE 4B][payload] -- and
@@ -234,6 +293,14 @@ pub enum ServerEvent {
         room_name: String,
         message: MessageHistoryItem,
     },
+    // A message was removed server-side and should be dropped from the room view.
+    // Emitted for unsend/admin deletion and when a rejected upload leaves a
+    // message with no attachments, so it would otherwise linger as a bare filename
+    // or caption for everyone in the room.
+    MessageRemoved {
+        room_name: String,
+        message_id: Uuid,
+    },
     // The session fell behind a room's live buffer and dropped events. Not an
     // error -- a hint to re-fetch that room from history (GetMessages); the read
     // watermark keeps the unread count correct meanwhile.
@@ -258,7 +325,7 @@ pub enum ServerEvent {
         created_at: DateTime<Utc>,
     },
     RoomMembers {
-        members: Vec<PublicUser>,
+        members: Vec<RoomMember>,
     },
     RoomInfo {
         room_name: String,
@@ -273,6 +340,20 @@ pub enum ServerEvent {
     },
     MyInvites {
         rooms: Vec<String>,
+    },
+    DiscoverableRooms {
+        rooms: Vec<DiscoverableRoom>,
+    },
+    // Reply to ListAllRooms (admin): every room with a live member count.
+    AllRooms {
+        rooms: Vec<DiscoverableRoom>,
+    },
+    // Reply to GetUsers: one page of the user directory, ordered by username.
+    // `has_more` is true when another page exists after this one (continue by
+    // passing the last entry's `username` as the next `after` cursor).
+    Users {
+        users: Vec<UserDirectoryEntry>,
+        has_more: bool,
     },
     NoChange,
     NoUserExists,
@@ -336,6 +417,34 @@ pub struct PublicUser {
     pub created_at: DateTime<Utc>,
 }
 
+// One entry in a GetUsers directory page: the public profile fields plus an
+// optional admin flag. `is_admin` is populated only when the *requesting* user is
+// an admin (the admin pane's "identify other admins"); for a regular caller it is
+// None and omitted from the wire, so admin status isn't exposed to non-admins.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct UserDirectoryEntry {
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub alias: Option<String>,
+    pub username: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_admin: Option<bool>,
+}
+
+// A room member as shown to clients: the public profile fields plus whether the
+// user is an owner of the room (memberships.is_owner), so the client can render
+// ownership and gate owner-only actions.
+#[derive(sqlx::FromRow, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RoomMember {
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub alias: Option<String>,
+    pub username: String,
+    pub created_at: DateTime<Utc>,
+    pub is_owner: bool,
+}
+
 #[derive(sqlx::FromRow)]
 pub struct Admin {
     pub user_id: Uuid,
@@ -387,6 +496,13 @@ pub struct NewRoom {
     pub owner_id: Uuid,
     pub is_public: bool,
     pub is_discoverable: bool,
+}
+
+#[derive(sqlx::FromRow, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DiscoverableRoom {
+    pub room_name: String,
+    pub is_public: bool,
+    pub member_count: i64,
 }
 
 #[derive(sqlx::FromRow)]

@@ -11,11 +11,11 @@ async fn login(server: &TestServer, username: &str, password: &str) -> Ws {
     ws
 }
 
-async fn post(ws: &mut Ws, room_id: Uuid, content: &str) -> Uuid {
+async fn post(ws: &mut Ws, room_name: &str, content: &str) -> Uuid {
     send_cmd(
         ws,
         &ClientCommand::SendMessage {
-            room_id,
+            room_name: room_name.to_owned(),
             content: content.to_owned(),
             attachments: vec![],
         },
@@ -74,11 +74,10 @@ async fn own_sends_are_not_unread_to_the_sender(pool: PgPool) {
     seed_user(&pool, "alice", "alicepw").await;
     seed_room(&pool, "vault", "alice", false, false).await;
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let room = room_id(&pool, "vault").await;
 
     let mut alice = login(&server, "alice", "alicepw").await;
-    post(&mut alice, room, "one").await;
-    post(&mut alice, room, "two").await;
+    post(&mut alice, "vault", "one").await;
+    post(&mut alice, "vault", "two").await;
 
     // Sending advances the sender's own watermark, so the room reads as caught up.
     assert_eq!(unread_for(&mut alice, "vault").await, 0);
@@ -90,11 +89,10 @@ async fn new_member_starts_caught_up_then_accrues_unread(pool: PgPool) {
     seed_user(&pool, "bob", "bobpw").await;
     seed_room(&pool, "vault", "alice", true, false).await;
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let room = room_id(&pool, "vault").await;
 
     let mut alice = login(&server, "alice", "alicepw").await;
-    post(&mut alice, room, "before bob 1").await;
-    post(&mut alice, room, "before bob 2").await;
+    post(&mut alice, "vault", "before bob 1").await;
+    post(&mut alice, "vault", "before bob 2").await;
 
     // Bob joins after the backlog exists: caught up, not a wall of unread.
     let mut bob = login(&server, "bob", "bobpw").await;
@@ -102,7 +100,7 @@ async fn new_member_starts_caught_up_then_accrues_unread(pool: PgPool) {
     assert_eq!(unread_for(&mut bob, "vault").await, 0);
 
     // Messages sent after he joined are unread to him.
-    post(&mut alice, room, "after bob").await;
+    post(&mut alice, "vault", "after bob").await;
     assert_eq!(unread_for(&mut bob, "vault").await, 1);
 }
 
@@ -112,14 +110,13 @@ async fn mark_read_clears_unread(pool: PgPool) {
     seed_user(&pool, "bob", "bobpw").await;
     seed_room(&pool, "vault", "alice", true, false).await;
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let room = room_id(&pool, "vault").await;
 
     let mut alice = login(&server, "alice", "alicepw").await;
     let mut bob = login(&server, "bob", "bobpw").await;
     join(&mut bob, "vault").await;
 
-    post(&mut alice, room, "m1").await;
-    let newest = post(&mut alice, room, "m2").await;
+    post(&mut alice, "vault", "m1").await;
+    let newest = post(&mut alice, "vault", "m2").await;
     assert_eq!(unread_for(&mut bob, "vault").await, 2);
 
     mark_read(&mut bob, "vault", newest).await;
@@ -132,14 +129,13 @@ async fn mark_read_is_forward_only(pool: PgPool) {
     seed_user(&pool, "bob", "bobpw").await;
     seed_room(&pool, "vault", "alice", true, false).await;
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let room = room_id(&pool, "vault").await;
 
     let mut alice = login(&server, "alice", "alicepw").await;
     let mut bob = login(&server, "bob", "bobpw").await;
     join(&mut bob, "vault").await;
 
-    let older = post(&mut alice, room, "m1").await;
-    let newest = post(&mut alice, room, "m2").await;
+    let older = post(&mut alice, "vault", "m1").await;
+    let newest = post(&mut alice, "vault", "m2").await;
 
     mark_read(&mut bob, "vault", newest).await;
     assert_eq!(unread_for(&mut bob, "vault").await, 0);
@@ -156,10 +152,9 @@ async fn non_member_cannot_mark_read(pool: PgPool) {
     seed_user(&pool, "mallory", "mallorypw").await;
     seed_room(&pool, "vault", "alice", false, false).await;
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let room = room_id(&pool, "vault").await;
 
     let mut alice = login(&server, "alice", "alicepw").await;
-    let message_id = post(&mut alice, room, "secret").await;
+    let message_id = post(&mut alice, "vault", "secret").await;
 
     let mut mallory = login(&server, "mallory", "mallorypw").await;
     send_cmd(
@@ -180,7 +175,6 @@ async fn summary_lists_every_room_including_zero_unread(pool: PgPool) {
     seed_room(&pool, "vault", "alice", true, false).await;
     seed_room(&pool, "lounge", "alice", false, false).await;
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let vault = room_id(&pool, "vault").await;
 
     let mut alice = login(&server, "alice", "alicepw").await;
     let mut bob = login(&server, "bob", "bobpw").await;
@@ -188,8 +182,8 @@ async fn summary_lists_every_room_including_zero_unread(pool: PgPool) {
 
     // Bob posts in vault; alice never read or sent there, so it's unread to her.
     // alice's lounge has no messages -> still listed, at zero.
-    post(&mut bob, vault, "hi").await;
-    post(&mut bob, vault, "again").await;
+    post(&mut bob, "vault", "hi").await;
+    post(&mut bob, "vault", "again").await;
 
     let rooms = summary(&mut alice).await;
     // Ordered by room_name: lounge before vault.

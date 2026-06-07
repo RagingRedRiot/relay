@@ -61,13 +61,14 @@ Handle::op(args)
 |---|---|---|
 | auth | `AuthHandle` | `authenticate(username, password) → user_id` |
 | user | `UserHandle` | `new_user`, `edit_user`, `promote`, `demote`, `delete_user`, `update_password`, `reset_password`, `is_admin`, `get_user_by_username` |
-| room | `RoomHandle` | `new_room`, `get_room`, `get_room_members`, `set_room_name`, `add_room_owner`, `join_room`, `leave_room`, invites (`invite`/`accept`/`decline`/`get_my_invites`), requests (`approve`/`reject`/`get_my`/`get_incoming`) |
+| room | `RoomHandle` | `new_room`, `get_room`, `get_room_members`, `set_room_name`, `add_room_owner`, `join_room`, `leave_room`, `remove_room_member` (kick), `list_discoverable_rooms`, `list_all_rooms` (admin), invites (`invite`/`accept`/`decline`/`get_my_invites`), requests (`approve`/`reject`/`cancel`/`get_my`/`get_incoming`) |
 | message | `MessageHandle` | `send_message`, `get_messages`, `mark_read`, `get_unread_summary`, `add_reaction`, `remove_reaction` |
 
 > `auth` is spawned in `main` (before `app()`) so the WebSocket prelude can
 > authenticate without the rest of `AppState`. `room` and `message` receive a `Hub`
 > clone at spawn — `message` to **publish** `NewMessage`, `room` to **subscribe** a
-> just-approved user's sessions cross-session.
+> just-approved user's sessions and to **unsubscribe** a just-removed (kicked) user's
+> sessions, both cross-session.
 
 ## Per-connection channels (`handle_socket`)
 
@@ -87,12 +88,13 @@ teardown).
 | Map | Key → Value | Written by | Read by |
 |---|---|---|---|
 | `rooms` | `room_id → broadcast::Sender<Arc<ServerEvent>>` | `subscribe` (lazy create), `publish` (self-prune) | sender tasks (via `subscribe`) |
-| `sessions` | `user_id → [ { session_id, sub_tx } ]` | `register_session` / `SessionGuard` drop | `subscribe_user_to_room` |
+| `sessions` | `user_id → [ { session_id, sub_tx } ]` | `register_session` / `SessionGuard` drop | `subscribe_user_to_room`, `unsubscribe_user_from_room` |
 
 Methods: `subscribe(room_id) → Receiver`, `publish(room_id, event)`,
 `register_session(user_id, sub_tx) → SessionGuard`,
-`subscribe_user_to_room(user_id, room_id, room_name)`. Each is sync and
-non-blocking; the lock is never held across `.await`.
+`subscribe_user_to_room(user_id, room_id, room_name)`,
+`unsubscribe_user_from_room(user_id, room_id)`. Each is sync and non-blocking; the
+lock is never held across `.await`.
 
 ## Concurrency bounds (where the limits are)
 

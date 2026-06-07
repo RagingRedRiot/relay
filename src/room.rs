@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::hub::Hub;
-use crate::model::{self, JoinRequestInfo, PublicUser, Room};
+use crate::model::{self, DiscoverableRoom, JoinRequestInfo, Room, RoomMember};
 
 pub enum RoomRequest {
     NewRoomRequest {
@@ -47,8 +47,21 @@ pub enum RoomRequest {
         room_name: String,
         tx: oneshot::Sender<RoomResponse>,
     },
+    // Owner/admin removes another user's membership.
+    RemoveRoomMember {
+        source_user_id: Uuid,
+        room_name: String,
+        member_username: String,
+        tx: oneshot::Sender<RoomResponse>,
+    },
     GetMyJoinRequests {
         source_user_id: Uuid,
+        tx: oneshot::Sender<RoomResponse>,
+    },
+    // The caller withdraws their own pending join request.
+    CancelJoinRequest {
+        user_id: Uuid,
+        room_name: String,
         tx: oneshot::Sender<RoomResponse>,
     },
     GetIncomingJoinRequests {
@@ -87,6 +100,14 @@ pub enum RoomRequest {
         room_name: String,
         tx: oneshot::Sender<RoomResponse>,
     },
+    ListDiscoverableRooms {
+        tx: oneshot::Sender<RoomResponse>,
+    },
+    // Admin only: every room, including private non-discoverable ones.
+    ListAllRooms {
+        source_user_id: Uuid,
+        tx: oneshot::Sender<RoomResponse>,
+    },
 }
 
 pub enum RoomResponse {
@@ -99,7 +120,7 @@ pub enum RoomResponse {
         is_discoverable: bool,
     },
     RoomMembership {
-        members: Vec<PublicUser>,
+        members: Vec<RoomMember>,
     },
     MyJoinRequests {
         rooms: Vec<String>,
@@ -109,6 +130,12 @@ pub enum RoomResponse {
     },
     MyInvites {
         rooms: Vec<String>,
+    },
+    DiscoverableRooms {
+        rooms: Vec<DiscoverableRoom>,
+    },
+    AllRooms {
+        rooms: Vec<DiscoverableRoom>,
     },
     NoRoomExists,
     JoinRequested,
@@ -270,12 +297,56 @@ impl RoomHandle {
         rx.await.unwrap_or(RoomResponse::Failed)
     }
 
+    pub async fn remove_room_member(
+        &self,
+        source_user_id: Uuid,
+        room_name: String,
+        member_username: String,
+    ) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::RemoveRoomMember {
+                source_user_id,
+                room_name,
+                member_username,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
     pub async fn get_my_join_requests(&self, source_user_id: Uuid) -> RoomResponse {
         let (tx, rx) = oneshot::channel();
 
         if self
             .sender
             .send(RoomRequest::GetMyJoinRequests { source_user_id, tx })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
+    pub async fn cancel_join_request(&self, user_id: Uuid, room_name: String) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::CancelJoinRequest {
+                user_id,
+                room_name,
+                tx,
+            })
             .await
             .is_err()
         {
@@ -419,6 +490,36 @@ impl RoomHandle {
                 room_name,
                 tx,
             })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
+    pub async fn list_discoverable_rooms(&self) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::ListDiscoverableRooms { tx })
+            .await
+            .is_err()
+        {
+            return RoomResponse::Failed;
+        }
+
+        rx.await.unwrap_or(RoomResponse::Failed)
+    }
+
+    pub async fn list_all_rooms(&self, source_user_id: Uuid) -> RoomResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(RoomRequest::ListAllRooms { source_user_id, tx })
             .await
             .is_err()
         {
@@ -868,8 +969,8 @@ async fn handle_request(
                 }
             }
 
-            let users = match sqlx::query_as::<_, PublicUser>(
-                "SELECT u.first_name, u.last_name, u.alias, u.username, u.created_at
+            let users = match sqlx::query_as::<_, RoomMember>(
+                "SELECT u.first_name, u.last_name, u.alias, u.username, u.created_at, m.is_owner
                 FROM memberships m
                 JOIN users u ON u.user_id = m.user_id
                 WHERE m.room_id = $1
@@ -1026,6 +1127,142 @@ async fn handle_request(
                 1 => (RoomResponse::Success, tx),
                 0 => (RoomResponse::NoChange, tx),
                 _ => unreachable!(),
+            }
+        }
+
+        RoomRequest::RemoveRoomMember {
+            source_user_id,
+            room_name,
+            member_username,
+            tx,
+        } => {
+            let mut db: sqlx::Transaction<'_, sqlx::Postgres> = match pool.begin().await {
+                Ok(db) => db,
+                Err(e) => {
+                    tracing::error!(error = %e, "remove_room_member: begin transaction failed");
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            let room_for_log = room_name.clone();
+            let member_for_log = member_username.clone();
+
+            // Authorize: caller must own the room (or be an admin). Lock the room
+            // row so the membership delete sees a stable authorization decision.
+            let gate = match sqlx::query_as::<_, (Uuid, bool)>(
+                "SELECT
+                    r.room_id,
+                    (EXISTS (SELECT 1 FROM memberships m
+                             WHERE m.room_id = r.room_id AND m.user_id = $1 AND m.is_owner)
+                     OR EXISTS (SELECT 1 FROM admins a WHERE a.user_id = $1)) AS authorized
+                FROM rooms r
+                WHERE LOWER(r.room_name) = LOWER(trim_ws($2))
+                FOR UPDATE OF r",
+            )
+            .bind(source_user_id)
+            .bind(room_name)
+            .fetch_optional(&mut *db)
+            .await
+            {
+                Ok(gate) => gate,
+                Err(e) => {
+                    tracing::error!(error = %e, "remove_room_member: room authorization lookup failed");
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // "No such room" and "not authorized" are reported identically so a
+            // non-owner can't probe a private room's existence.
+            let Some((room_id, authorized)) = gate else {
+                tracing::debug!(room = %room_for_log, "remove_room_member: no such room");
+                return (RoomResponse::Failed, tx);
+            };
+            if !authorized {
+                tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, room = %room_for_log, "remove_room_member denied: caller is not an owner or admin");
+                return (RoomResponse::Failed, tx);
+            }
+
+            // Remove the target's membership, capturing their id so we can drop the
+            // room's live stream from their sessions. Zero rows -- not a member --
+            // NoChange.
+            let removed_user_id = match sqlx::query_scalar::<_, Uuid>(
+                "DELETE FROM memberships
+                    WHERE room_id = $1
+                    AND user_id = (SELECT user_id FROM users
+                                   WHERE LOWER(username) = LOWER(trim_ws($2)))
+                    RETURNING user_id",
+            )
+            .bind(room_id)
+            .bind(member_username)
+            .fetch_optional(&mut *db)
+            .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::error!(error = %e, %room_id, "remove_room_member: membership delete failed");
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            let Some(removed_user_id) = removed_user_id else {
+                return (RoomResponse::NoChange, tx);
+            };
+
+            match db.commit().await {
+                Ok(_) => {
+                    tracing::info!(target: crate::logging::AUDIT, actor = %source_user_id, room = %room_for_log, target = %member_for_log, %room_id, "room member removed");
+                    // Cross-session: the removed user isn't the caller. Drop the
+                    // room's live stream from any of their open sessions now, so
+                    // they stop receiving its messages immediately instead of at
+                    // their next reconnect. Their JIT membership checks already block
+                    // posting/reading/downloading.
+                    hub.unsubscribe_user_from_room(removed_user_id, room_id);
+                    (RoomResponse::Success, tx)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, %room_id, "remove_room_member: commit failed");
+                    (RoomResponse::Failed, tx)
+                }
+            }
+        }
+
+        RoomRequest::CancelJoinRequest {
+            user_id,
+            room_name,
+            tx,
+        } => {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(e) => {
+                    tracing::error!(error = %e, "cancel_join_request: acquire connection failed");
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Withdraw the caller's own pending request, resolving the room by name
+            // inline. A non-existent room or no pending request both delete zero
+            // rows -> NoChange. No authorization needed: a user owns their request.
+            let result = match sqlx::query(
+                "DELETE FROM room_join_requests
+                    WHERE user_id = $1
+                    AND room_id = (SELECT room_id FROM rooms
+                                   WHERE LOWER(room_name) = LOWER(trim_ws($2)))",
+            )
+            .bind(user_id)
+            .bind(room_name)
+            .execute(&mut *db)
+            .await
+            {
+                Ok(res) => res,
+                Err(e) => {
+                    tracing::error!(error = %e, "cancel_join_request: request delete failed");
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            match result.rows_affected() {
+                0 => (RoomResponse::NoChange, tx),
+                _ => (RoomResponse::Success, tx),
             }
         }
 
@@ -1526,6 +1763,91 @@ async fn handle_request(
                 0 => (RoomResponse::NoChange, tx),
                 _ => unreachable!(),
             }
+        }
+
+        RoomRequest::ListDiscoverableRooms { tx } => {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(e) => {
+                    tracing::error!(error = %e, "list_discoverable_rooms: acquire connection failed");
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // All rooms that are public or discoverable, with a live member count.
+            // Private non-discoverable rooms are excluded -- their existence must
+            // not be leaked to non-members.
+            let rooms = match sqlx::query_as::<_, DiscoverableRoom>(
+                "SELECT r.room_name, r.is_public,
+                        COUNT(m.user_id) AS member_count
+                    FROM rooms r
+                    LEFT JOIN memberships m ON m.room_id = r.room_id
+                    WHERE r.is_public OR r.is_discoverable
+                    GROUP BY r.room_id
+                    ORDER BY member_count DESC, r.room_name",
+            )
+            .fetch_all(&mut *db)
+            .await
+            {
+                Ok(rooms) => rooms,
+                Err(e) => {
+                    tracing::error!(error = %e, "list_discoverable_rooms: query failed");
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            (RoomResponse::DiscoverableRooms { rooms }, tx)
+        }
+
+        RoomRequest::ListAllRooms { source_user_id, tx } => {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(e) => {
+                    tracing::error!(error = %e, "list_all_rooms: acquire connection failed");
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            // Admin only: listing every room (private ones included) is a
+            // moderation capability. A non-admin caller is rejected outright.
+            let is_admin: bool = match sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM admins a WHERE a.user_id = $1)",
+            )
+            .bind(source_user_id)
+            .fetch_one(&mut *db)
+            .await
+            {
+                Ok(is_admin) => is_admin,
+                Err(e) => {
+                    tracing::error!(error = %e, "list_all_rooms: admin check failed");
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+            if !is_admin {
+                tracing::warn!(target: crate::logging::AUDIT, actor = %source_user_id, "list_all_rooms denied: caller is not an admin");
+                return (RoomResponse::Failed, tx);
+            }
+
+            // Every room, with a live member count -- no visibility filter.
+            let rooms = match sqlx::query_as::<_, DiscoverableRoom>(
+                "SELECT r.room_name, r.is_public,
+                        COUNT(m.user_id) AS member_count
+                    FROM rooms r
+                    LEFT JOIN memberships m ON m.room_id = r.room_id
+                    GROUP BY r.room_id
+                    ORDER BY member_count DESC, r.room_name",
+            )
+            .fetch_all(&mut *db)
+            .await
+            {
+                Ok(rooms) => rooms,
+                Err(e) => {
+                    tracing::error!(error = %e, "list_all_rooms: query failed");
+                    return (RoomResponse::Failed, tx);
+                }
+            };
+
+            (RoomResponse::AllRooms { rooms }, tx)
         }
     }
 }

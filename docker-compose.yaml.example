@@ -1,0 +1,32 @@
+# Local development database.
+#
+# Requires PostgreSQL 18+ — the schema uses uuidv7(), a built-in added in PG18.
+# Older images will fail migrations with "function uuidv7() does not exist".
+#
+# Usage:
+#   cp docker-compose.yaml.example docker-compose.yml
+#   docker compose up -d
+#
+# Credentials match the DATABASE_URL default in .env.example, so no extra
+# config is needed for a stock local setup.
+
+services:
+  db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay
+      POSTGRES_DB: relay
+    ports:
+      - "5432:5432"
+    volumes:
+      - relay_pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  relay_pgdata:

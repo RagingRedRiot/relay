@@ -35,8 +35,13 @@ valid there:
   one-shot account-creation handshake: the server replies `UserCreated` then
   `Close`. To then *use* the account you must **open a new connection and `Auth`**.
 
-Send nothing else until you've received `AuthOk`. Any other first frame closes the
-socket.
+The one exception: you may send **`GetSignupStatus`** in the prelude (before
+authenticating) and the server replies `SignupStatus { open_signups }` **without**
+ending the prelude — so a login screen can decide whether to offer registration
+before the user does anything. You can then `Auth` / `NewUser` on the same socket.
+Apart from that query, send nothing else until you've received `AuthOk`: any other
+first frame closes the socket. (The query is rate-capped pre-auth, so query once and
+cache the answer rather than polling.)
 
 ## 2. The socket is a mixed stream
 
@@ -44,9 +49,11 @@ After `AuthOk` there is **no strict request/response framing**. Command replies 
 unsolicited **pushed events** share the one socket and interleave in unspecified
 order. Your read loop must dispatch by event type, not by position. In particular:
 
-- `NewMessage`, `Resync` (live room events) can arrive at any moment — including
-  *between* a command you sent and its reply, and *during* an attachment download's
-  binary frames.
+- `NewMessage`, `MessageRemoved`, `Resync` (live room events) can arrive at any
+  moment — including *between* a command you sent and its reply, and *during* an
+  attachment download's binary frames. `MessageRemoved { room_name, message_id }`
+  means drop that message from the view; it fires on an unsend, an admin removal, or
+  a file-only upload whose attachment was rejected.
 - A command's reply is identified by its **type/content**, not by being "next."
 
 A client that does blocking "send command, read one frame as the reply" will
@@ -79,7 +86,14 @@ Bytes never travel as JSON. The flow:
    ```
    [ attachment_id : 16B ][ seq : u32 big-endian : 4B ][ payload … ]
    ```
-4. On success you get `AttachmentComplete { attachment_id }`.
+4. The server verifies the bytes and applies its content-type policy, then replies
+   with **either** `AttachmentComplete { attachment_id }` (accepted) **or**
+   `AttachmentRejected { attachment_id, reason }` (the file isn't an allowed type, or
+   its bytes don't match a text declaration). Key your upload UI off the
+   `attachment_id` and handle both outcomes. On rejection the server also **deletes
+   the attachment** and broadcasts `AttachmentRejected` to room subscribers so live
+   clients remove that attachment from view. If that empties the message, the server
+   also **deletes the message** and broadcasts `MessageRemoved`; clients drop it.
 
 Obligations:
 
@@ -90,6 +104,13 @@ Obligations:
   declared `size_bytes` and `content_sha256`. A mismatch leaves the attachment
   permanently incomplete and yields a generic failure — re-sending can't fix a bad
   declaration (chunks are keep-first). Recompute and re-declare on a new message.
+- **Only supported types are accepted, and the server is authoritative on type.**
+  After the bytes verify, the server sniffs them: it stores the *detected* type for
+  recognized binary formats (correcting a mislabeled `content_type`) and honors only
+  an allowlist of text types otherwise; unsupported or mismatched files get
+  `AttachmentRejected` and never complete. Don't rely on your declared `content_type`
+  surviving unchanged — read it back from history. See the policy in
+  [`reference/wire-protocol.md`](reference/wire-protocol.md#attachment-content-type-policy).
 - **Keep chunks flowing.** An upload that idles is abandoned server-side after a
   short timeout. Resumption is supported — re-sending a seq is idempotent, so a
   stalled upload continues by sending only the missing seqs — but you must drive it.

@@ -13,11 +13,11 @@ async fn login(server: &TestServer, username: &str, password: &str) -> Ws {
 }
 
 // Post a message over the wire and return its id.
-async fn post(ws: &mut Ws, room_id: Uuid, content: &str) -> Uuid {
+async fn post(ws: &mut Ws, room_name: &str, content: &str) -> Uuid {
     send_cmd(
         ws,
         &ClientCommand::SendMessage {
-            room_id,
+            room_name: room_name.to_owned(),
             content: content.to_owned(),
             attachments: vec![],
         },
@@ -67,12 +67,11 @@ async fn returns_room_messages_newest_first(pool: PgPool) {
     seed_user(&pool, "alice", "alicepw").await;
     seed_room(&pool, "vault", "alice", false, false).await;
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let room = room_id(&pool, "vault").await;
 
     let mut ws = login(&server, "alice", "alicepw").await;
-    post(&mut ws, room, "first").await;
-    post(&mut ws, room, "second").await;
-    post(&mut ws, room, "third").await;
+    post(&mut ws, "vault", "first").await;
+    post(&mut ws, "vault", "second").await;
+    post(&mut ws, "vault", "third").await;
 
     let page = history(&mut ws, "vault", None, None).await;
     assert_eq!(contents(&page), vec!["third", "second", "first"]);
@@ -85,11 +84,10 @@ async fn paginates_backwards_with_before_cursor(pool: PgPool) {
     seed_user(&pool, "alice", "alicepw").await;
     seed_room(&pool, "vault", "alice", false, false).await;
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let room = room_id(&pool, "vault").await;
 
     let mut ws = login(&server, "alice", "alicepw").await;
     for n in 1..=5 {
-        post(&mut ws, room, &format!("m{n}")).await;
+        post(&mut ws, "vault", &format!("m{n}")).await;
     }
 
     let page1 = history(&mut ws, "vault", None, Some(2)).await;
@@ -114,11 +112,10 @@ async fn limit_is_clamped(pool: PgPool) {
     seed_user(&pool, "alice", "alicepw").await;
     seed_room(&pool, "vault", "alice", false, false).await;
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let room = room_id(&pool, "vault").await;
 
     let mut ws = login(&server, "alice", "alicepw").await;
     for n in 1..=3 {
-        post(&mut ws, room, &format!("m{n}")).await;
+        post(&mut ws, "vault", &format!("m{n}")).await;
     }
 
     // limit 0 floors to 1 rather than returning nothing.
@@ -131,13 +128,12 @@ async fn attachments_appear_in_history(pool: PgPool) {
     seed_user(&pool, "alice", "alicepw").await;
     seed_room(&pool, "vault", "alice", false, false).await;
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let room = room_id(&pool, "vault").await;
 
     let mut ws = login(&server, "alice", "alicepw").await;
     send_cmd(
         &mut ws,
         &ClientCommand::SendMessage {
-            room_id: room,
+            room_name: "vault".to_owned(),
             content: "with file".to_owned(),
             attachments: vec![NewMessageAttachment {
                 filename: "notes.txt".to_owned(),
@@ -172,10 +168,9 @@ async fn reactions_are_summarized_with_caller_flag(pool: PgPool) {
     seed_room(&pool, "vault", "alice", false, false).await;
     seed_membership(&pool, "vault", "bob").await;
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let room = room_id(&pool, "vault").await;
 
     let mut alice = login(&server, "alice", "alicepw").await;
-    let message_id = post(&mut alice, room, "react to me").await;
+    let message_id = post(&mut alice, "vault", "react to me").await;
 
     // alice 👍 ; bob 👍 and 🎉
     let mut bob = login(&server, "bob", "bobpw").await;
@@ -211,10 +206,9 @@ async fn non_member_is_denied_and_room_existence_hidden(pool: PgPool) {
     seed_user(&pool, "mallory", "mallorypw").await;
     seed_room(&pool, "vault", "alice", false, false).await;
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let room = room_id(&pool, "vault").await;
 
     let mut alice = login(&server, "alice", "alicepw").await;
-    post(&mut alice, room, "secret").await;
+    post(&mut alice, "vault", "secret").await;
 
     let mut mallory = login(&server, "mallory", "mallorypw").await;
 
@@ -231,6 +225,25 @@ async fn non_member_is_denied_and_room_existence_hidden(pool: PgPool) {
         .await;
         assert_eq!(next_reply(&mut mallory).await, ServerEvent::Failed);
     }
+}
+
+// An admin can read history in a private room they're not a member of, so they
+// can moderate any room's content.
+#[sqlx::test]
+async fn admin_reads_non_member_room(pool: PgPool) {
+    seed_admin(&pool, "admin", "adminpw").await;
+    seed_user(&pool, "alice", "alicepw").await;
+    seed_room(&pool, "vault", "alice", false, false).await;
+    let server = spawn_app(pool.clone(), |_| {}).await;
+
+    let mut alice = login(&server, "alice", "alicepw").await;
+    post(&mut alice, "vault", "members only").await;
+    post(&mut alice, "vault", "still here").await;
+
+    // admin is not a member, but reads the full history anyway.
+    let mut admin = login(&server, "admin", "adminpw").await;
+    let page = history(&mut admin, "vault", None, None).await;
+    assert_eq!(contents(&page), vec!["still here", "members only"]);
 }
 
 #[sqlx::test]

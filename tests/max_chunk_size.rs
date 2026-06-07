@@ -18,17 +18,20 @@ fn framework_default_payload() -> usize {
 // Declare a single-chunk attachment on a fresh message in `room_id`, sized and
 // hashed for `payload`, and return its attachment_id. The bytes still have to be
 // streamed up separately; this just creates the (incomplete) row to stream into.
-async fn declare_single_chunk(ws: &mut Ws, room_id: Uuid, payload: &[u8]) -> Uuid {
+async fn declare_single_chunk(ws: &mut Ws, room_name: &str, payload: &[u8]) -> Uuid {
     let mut hasher = Sha256::new();
     hasher.update(payload);
     send_cmd(
         ws,
         &ClientCommand::SendMessage {
-            room_id,
+            room_name: room_name.to_owned(),
             content: "file".to_owned(),
             attachments: vec![NewMessageAttachment {
-                filename: "f.bin".to_owned(),
-                content_type: "application/octet-stream".to_owned(),
+                // These chunk-sizing tests use repeated 0x07 bytes, which have no
+                // magic signature and no NUL, so the content-type policy accepts
+                // them as the declared text type. Content is incidental here.
+                filename: "f.txt".to_owned(),
+                content_type: "text/plain".to_owned(),
                 size_bytes: payload.len() as i64,
                 chunk_count: 1,
                 content_sha256: hasher.finalize().to_vec(),
@@ -95,9 +98,8 @@ async fn chunk_exactly_at_limit_completes(pool: PgPool) {
     let mut ws = create_socket(server.addr).await;
     authenticate(&mut ws, "alice", "alicepw").await;
 
-    let rid = room_id(&pool, "general").await;
     let payload = vec![7u8; 4096];
-    let attachment_id = declare_single_chunk(&mut ws, rid, &payload).await;
+    let attachment_id = declare_single_chunk(&mut ws, "general", &payload).await;
     send_chunk_frame(&mut ws, attachment_id, 0, &payload).await;
 
     match next_reply(&mut ws).await {
@@ -120,9 +122,8 @@ async fn chunk_one_byte_over_limit_drops_the_connection(pool: PgPool) {
     let mut ws = create_socket(server.addr).await;
     authenticate(&mut ws, "alice", "alicepw").await;
 
-    let rid = room_id(&pool, "general").await;
     let payload = vec![7u8; 4097];
-    let attachment_id = declare_single_chunk(&mut ws, rid, &payload).await;
+    let attachment_id = declare_single_chunk(&mut ws, "general", &payload).await;
     send_chunk_frame(&mut ws, attachment_id, 0, &payload).await;
 
     // We never get a normal ServerEvent back -- the connection closes. The drop
@@ -158,9 +159,8 @@ async fn chunk_larger_than_framework_default_is_accepted_when_configured(pool: P
     let mut ws = create_socket(server.addr).await;
     authenticate(&mut ws, "alice", "alicepw").await;
 
-    let rid = room_id(&pool, "general").await;
     let payload = vec![7u8; 17 * 1024 * 1024];
-    let attachment_id = declare_single_chunk(&mut ws, rid, &payload).await;
+    let attachment_id = declare_single_chunk(&mut ws, "general", &payload).await;
     send_chunk_frame(&mut ws, attachment_id, 0, &payload).await;
 
     match next_reply(&mut ws).await {

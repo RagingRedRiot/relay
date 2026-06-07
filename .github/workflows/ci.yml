@@ -28,6 +28,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # The binary embeds frontend/dist/ at compile time (rust-embed), so the
+      # client must be built before any cargo compile step.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build embedded frontend
+        run: npm ci && npm run build
+        working-directory: frontend
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --locked -- -D warnings
 
@@ -55,6 +65,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # The binary embeds frontend/dist/ at compile time (rust-embed), so the
+      # client must be built before any cargo compile step.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build embedded frontend
+        run: npm ci && npm run build
+        working-directory: frontend
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
 

@@ -206,15 +206,16 @@ async fn spawn_receiver_task(
             &mut receiver,
             &auth_handle,
             &handles.user_handle,
+            &user_tx,
             open_signups,
         )
         .await;
 
         match server_event {
-            ServerEvent::AuthOk => {
+            ServerEvent::AuthOk { is_admin } => {
                 tracing::Span::current().record("user_id", tracing::field::display(user_id));
                 tracing::debug!("session authenticated");
-                let _ = user_tx.send(ServerEvent::AuthOk).await;
+                let _ = user_tx.send(ServerEvent::AuthOk { is_admin }).await;
             }
             // Anything but AuthOk results in shutdown
             ServerEvent::NoAuth => {
@@ -329,6 +330,7 @@ async fn spawn_receiver_task(
                                         &write_semaphore,
                                         &user_tx,
                                         user_id,
+                                        &hub,
                                         &shutdown,
                                     )
                                     .await;
@@ -549,10 +551,30 @@ async fn process_message(
             }
 
             ClientCommand::SendMessage {
-                room_id,
+                room_name,
                 content,
                 attachments,
             } => {
+                // Resolve the caller-supplied room name to a UUID for the
+                // internal message actor (which keys everything by room_id).
+                let room_id = match sqlx::query_scalar::<_, Uuid>(
+                    "SELECT room_id FROM rooms WHERE LOWER(room_name) = LOWER(trim_ws($1))",
+                )
+                .bind(&room_name)
+                .fetch_optional(pool)
+                .await
+                {
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        let _ = user_tx.send(ServerEvent::Failed).await;
+                        return ControlFlow::Continue(());
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "send_message: room name lookup failed");
+                        let _ = user_tx.send(ServerEvent::Failed).await;
+                        return ControlFlow::Continue(());
+                    }
+                };
                 // The sender is the authenticated session user, never taken from
                 // the client. Membership auth happens inside the actor's
                 // transaction. On success the client gets the new message_id plus
@@ -609,6 +631,13 @@ async fn process_message(
                     .await;
             }
 
+            ClientCommand::GetSignupStatus => {
+                // Public server setting; also answerable in the prelude (pre-auth).
+                let _ = user_tx
+                    .send(ServerEvent::SignupStatus { open_signups })
+                    .await;
+            }
+
             ClientCommand::AddReaction { message_id, emoji } => {
                 // The reactor is the authenticated session user, never client-
                 // supplied. Membership auth happens inside the actor; an
@@ -639,6 +668,25 @@ async fn process_message(
                     }
                     _ => {
                         tracing::debug!("remove_reaction: request failed");
+                        let _ = user_tx.send(ServerEvent::Failed).await;
+                    }
+                }
+            }
+
+            ClientCommand::DeleteMessage { message_id } => {
+                // The deleter is the authenticated session user; sender-or-admin auth
+                // happens inside the actor, which also fans out the MessageRemoved on
+                // success. A forbidden or unknown message collapses to a generic Failed.
+                let response = handles
+                    .message_handle
+                    .delete_message(user_id, message_id)
+                    .await;
+                match response {
+                    MessageResponse::Success => {
+                        let _ = user_tx.send(ServerEvent::Success).await;
+                    }
+                    _ => {
+                        tracing::debug!("delete_message: request failed");
                         let _ = user_tx.send(ServerEvent::Failed).await;
                     }
                 }
@@ -793,6 +841,28 @@ async fn process_message(
                     }
                     _ => {
                         tracing::debug!("get_user_by_username: request failed");
+                        let _ = user_tx.send(ServerEvent::Failed).await;
+                    }
+                }
+            }
+
+            ClientCommand::GetUsers {
+                starts_with,
+                after,
+                limit,
+            } => {
+                // Open to any authenticated user; the caller's admin status (which
+                // gates the per-entry is_admin flag) is resolved inside the actor.
+                match handles
+                    .user_handle
+                    .get_users(user_id, starts_with, after, limit)
+                    .await
+                {
+                    UserResponse::Users { users, has_more } => {
+                        let _ = user_tx.send(ServerEvent::Users { users, has_more }).await;
+                    }
+                    _ => {
+                        tracing::debug!("get_users: request failed");
                         let _ = user_tx.send(ServerEvent::Failed).await;
                     }
                 }
@@ -1038,10 +1108,49 @@ async fn process_message(
                 }
             }
 
+            ClientCommand::RemoveRoomMember {
+                room_name,
+                member_username,
+            } => {
+                match handles
+                    .room_handle
+                    .remove_room_member(user_id, room_name, member_username)
+                    .await
+                {
+                    crate::room::RoomResponse::Success => {
+                        let _ = user_tx.send(ServerEvent::Success).await;
+                    }
+                    crate::room::RoomResponse::NoChange => {
+                        let _ = user_tx.send(ServerEvent::NoChange).await;
+                    }
+                    _ => {
+                        let _ = user_tx.send(ServerEvent::Failed).await;
+                    }
+                }
+            }
+
             ClientCommand::GetMyJoinRequests => {
                 match handles.room_handle.get_my_join_requests(user_id).await {
                     crate::room::RoomResponse::MyJoinRequests { rooms } => {
                         let _ = user_tx.send(ServerEvent::MyJoinRequests { rooms }).await;
+                    }
+                    _ => {
+                        let _ = user_tx.send(ServerEvent::Failed).await;
+                    }
+                }
+            }
+
+            ClientCommand::CancelJoinRequest { room_name } => {
+                match handles
+                    .room_handle
+                    .cancel_join_request(user_id, room_name)
+                    .await
+                {
+                    crate::room::RoomResponse::Success => {
+                        let _ = user_tx.send(ServerEvent::Success).await;
+                    }
+                    crate::room::RoomResponse::NoChange => {
+                        let _ = user_tx.send(ServerEvent::NoChange).await;
                     }
                     _ => {
                         let _ = user_tx.send(ServerEvent::Failed).await;
@@ -1173,6 +1282,28 @@ async fn process_message(
                     }
                 }
             }
+
+            ClientCommand::ListDiscoverableRooms => {
+                match handles.room_handle.list_discoverable_rooms().await {
+                    crate::room::RoomResponse::DiscoverableRooms { rooms } => {
+                        let _ = user_tx.send(ServerEvent::DiscoverableRooms { rooms }).await;
+                    }
+                    _ => {
+                        let _ = user_tx.send(ServerEvent::Failed).await;
+                    }
+                }
+            }
+
+            ClientCommand::ListAllRooms => {
+                match handles.room_handle.list_all_rooms(user_id).await {
+                    crate::room::RoomResponse::AllRooms { rooms } => {
+                        let _ = user_tx.send(ServerEvent::AllRooms { rooms }).await;
+                    }
+                    _ => {
+                        let _ = user_tx.send(ServerEvent::Failed).await;
+                    }
+                }
+            }
         },
         Err(e) => {
             // Client-caused: malformed/oversized/incomplete input. Not a server
@@ -1213,6 +1344,7 @@ async fn process_message(
 //
 // Frame layout:
 // [attachment_id: 16B][seq: u32 big-endian: 4B][payload...]
+#[allow(clippy::too_many_arguments)]
 async fn process_binary(
     data: Vec<u8>,
     attachments: &mut HashMap<Uuid, AttachmentHandle>,
@@ -1220,6 +1352,7 @@ async fn process_binary(
     write_semaphore: &Arc<Semaphore>,
     user_tx: &tokio::sync::mpsc::Sender<ServerEvent>,
     user_id: Uuid,
+    hub: &Hub,
     shutdown: &CancellationToken,
 ) {
     const HEADER_LEN: usize = attachment::CHUNK_HEADER_LEN;
@@ -1281,8 +1414,8 @@ async fn process_binary(
     // Spawn-on-first-chunk / resume: confirm the caller is the sender of the
     // attachment's message and fetch the metadata needed to detect completion. One
     // ownership check per attachment, not per chunk.
-    let meta = sqlx::query_as::<_, (i32, i64, Vec<u8>, bool)>(
-        "SELECT a.chunk_count, a.size_bytes, a.content_sha256, a.is_complete
+    let meta = sqlx::query_as::<_, (i32, i64, Vec<u8>, String, bool)>(
+        "SELECT a.chunk_count, a.size_bytes, a.content_sha256, a.content_type, a.is_complete
             FROM message_attachments a
             JOIN messages m ON m.message_id = a.message_id
             WHERE a.attachment_id = $1 AND m.sender_id = $2",
@@ -1292,7 +1425,7 @@ async fn process_binary(
     .fetch_optional(pool)
     .await;
 
-    let (chunk_count, size_bytes, content_sha256, is_complete) = match meta {
+    let (chunk_count, size_bytes, content_sha256, content_type, is_complete) = match meta {
         Ok(Some(row)) => row,
         Ok(None) => {
             let _ = user_tx
@@ -1322,9 +1455,11 @@ async fn process_binary(
         chunk_count,
         size_bytes,
         content_sha256,
+        content_type,
         pool.clone(),
         write_semaphore.clone(),
         user_tx.clone(),
+        hub.clone(),
         shutdown.clone(),
     );
 
@@ -1362,76 +1497,110 @@ async fn new_user(
         .await
 }
 
+// Largest number of pre-auth frames a client may send before it must Auth/NewUser.
+// Only GetSignupStatus is non-terminal, so this caps a flood of signup-status
+// queries on an unauthenticated socket, where the per-session limiter isn't active.
+const MAX_PRELUDE_FRAMES: u32 = 16;
+
 async fn prelude(
     receiver: &mut SplitStream<WebSocket>,
     auth_handle: &AuthHandle,
     user_handle: &UserHandle,
+    user_tx: &mpsc::Sender<ServerEvent>,
     open_signups: bool,
 ) -> (Uuid, ServerEvent) {
-    tokio::select! {
-        maybe_auth = receiver.next() => {
-            match maybe_auth {
-                Some(Ok(Message::Text(t))) => {
-                    match serde_json::from_str::<ClientCommand>(&t) {
-                        Ok(ClientCommand::Auth{username, password}) => {
-                            // Clone the username for audit logging; authenticate consumes it.
-                            match auth_handle.authenticate(username.clone(), password).await {
-                                AuthResult::Ok { user_id } => {
-                                    tracing::info!(target: crate::logging::AUDIT, %user_id, username = %username, "login succeeded");
-                                    (user_id, ServerEvent::AuthOk)
-                                }
-                                AuthResult::Failed => {
-                                    tracing::warn!(target: crate::logging::AUDIT, username = %username, "login failed");
-                                    (Uuid::nil(), ServerEvent::NoAuth)
-                                }
-                                // Server-side fault, not a credential rejection: already
-                                // logged at error! in the auth actor, so don't audit it
-                                // as a failed login.
-                                AuthResult::Error => (Uuid::nil(), ServerEvent::NoAuth),
+    // The prelude loops only for a GetSignupStatus query (answered, then it keeps
+    // waiting). Auth / NewUser / any other frame returns a terminal outcome and ends
+    // it, exactly as before — so a first Auth/NewUser frame behaves unchanged.
+    let mut frames: u32 = 0;
+    loop {
+        frames += 1;
+        if frames > MAX_PRELUDE_FRAMES {
+            tracing::debug!("prelude frame cap exceeded without auth");
+            return (Uuid::nil(), ServerEvent::NoAuth);
+        }
+
+        let maybe_auth = receiver.next().await;
+        return match maybe_auth {
+            Some(Ok(Message::Text(t))) => {
+                match serde_json::from_str::<ClientCommand>(&t) {
+                    // Pre-auth query: answer and keep waiting for Auth/NewUser.
+                    Ok(ClientCommand::GetSignupStatus) => {
+                        let _ = user_tx
+                            .send(ServerEvent::SignupStatus { open_signups })
+                            .await;
+                        continue;
+                    }
+                    Ok(ClientCommand::Auth { username, password }) => {
+                        // Clone the username for audit logging; authenticate consumes it.
+                        match auth_handle.authenticate(username.clone(), password).await {
+                            AuthResult::Ok { user_id } => {
+                                tracing::info!(target: crate::logging::AUDIT, %user_id, username = %username, "login succeeded");
+                                let is_admin = user_handle.is_admin(user_id).await;
+                                (user_id, ServerEvent::AuthOk { is_admin })
                             }
-                        },
-                        // Unauthenticated user creation is only allowed when open
-                        // signups are enabled in the config; otherwise reject it.
-                        Ok(ClientCommand::NewUser { username, .. }) if !open_signups => {
-                            tracing::warn!(target: crate::logging::AUDIT, username = %username, "signup rejected: open signups disabled");
-                            (Uuid::nil(), ServerEvent::NoAuth)
+                            AuthResult::Failed => {
+                                tracing::warn!(target: crate::logging::AUDIT, username = %username, "login failed");
+                                (Uuid::nil(), ServerEvent::NoAuth)
+                            }
+                            // Server-side fault, not a credential rejection: already
+                            // logged at error! in the auth actor, so don't audit it
+                            // as a failed login.
+                            AuthResult::Error => (Uuid::nil(), ServerEvent::NoAuth),
                         }
-                        Ok(ClientCommand::NewUser {
-                            username,
+                    }
+                    // Unauthenticated user creation is only allowed when open
+                    // signups are enabled in the config; otherwise reject it.
+                    Ok(ClientCommand::NewUser { username, .. }) if !open_signups => {
+                        tracing::warn!(target: crate::logging::AUDIT, username = %username, "signup rejected: open signups disabled");
+                        (Uuid::nil(), ServerEvent::NoAuth)
+                    }
+                    Ok(ClientCommand::NewUser {
+                        username,
+                        password,
+                        first_name,
+                        last_name,
+                        alias,
+                    }) => {
+                        // Clone the username for audit logging; new_user consumes it.
+                        match new_user(
+                            user_handle,
+                            username.clone(),
                             password,
                             first_name,
                             last_name,
-                            alias
-                        }) => {
-                            // Clone the username for audit logging; new_user consumes it.
-                            match new_user(user_handle, username.clone(), password, first_name, last_name, alias).await {
-                                // Account-creation audit happens in the user actor (the
-                                // single point both signup and authenticated paths hit).
-                                UserResponse::UserCreated { user_id } => (user_id, ServerEvent::UserCreated),
-                                UserResponse::Failed => {
-                                    // Detailed cause is logged in the user actor; this is just the prelude outcome.
-                                    tracing::debug!(username = %username, "open-signup user creation failed");
-                                    (Uuid::nil(), ServerEvent::Failed)
-                                }
-                                _ => {
-                                    tracing::debug!(username = %username, "open-signup user creation returned unexpected response");
-                                    (Uuid::nil(), ServerEvent::Failed)
-                                }
+                            alias,
+                        )
+                        .await
+                        {
+                            // Account-creation audit happens in the user actor (the
+                            // single point both signup and authenticated paths hit).
+                            UserResponse::UserCreated { user_id } => {
+                                (user_id, ServerEvent::UserCreated)
                             }
-                        },
-                        Err(e) => {
-                            tracing::debug!(error = %e, "undecodable command during prelude");
-                            (Uuid::nil(), ServerEvent::NoAuth)
+                            UserResponse::Failed => {
+                                // Detailed cause is logged in the user actor; this is just the prelude outcome.
+                                tracing::debug!(username = %username, "open-signup user creation failed");
+                                (Uuid::nil(), ServerEvent::Failed)
+                            }
+                            _ => {
+                                tracing::debug!(username = %username, "open-signup user creation returned unexpected response");
+                                (Uuid::nil(), ServerEvent::Failed)
+                            }
                         }
-                        _ => (Uuid::nil(), ServerEvent::NoAuth)
                     }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "undecodable command during prelude");
+                        (Uuid::nil(), ServerEvent::NoAuth)
+                    }
+                    _ => (Uuid::nil(), ServerEvent::NoAuth),
                 }
-                Some(Err(e)) => {
-                    tracing::debug!(error = %e, "websocket error during prelude");
-                    (Uuid::nil(), ServerEvent::NoAuth)
-                }
-                _ => (Uuid::nil(), ServerEvent::NoAuth)
             }
-        }
+            Some(Err(e)) => {
+                tracing::debug!(error = %e, "websocket error during prelude");
+                (Uuid::nil(), ServerEvent::NoAuth)
+            }
+            _ => (Uuid::nil(), ServerEvent::NoAuth),
+        };
     }
 }

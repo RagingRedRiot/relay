@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "A self-hosted chat platform POC in async Rust"
+default-run = "relay"
 
 [dependencies]
 argon2 = { version = "0.5.3", features = ["std"] }
@@ -14,11 +15,13 @@ dotenvy = "0.15.7"
 envy = "0.4.2"
 futures-util = "0.3.32"
 governor = "0.10.4"
-reqwest = "0.13.2"
+infer = "0.16"
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls"] }
+rust-embed = { version = "8", features = ["mime-guess"] }
 serde = "1.0.228"
 serde_json = "1.0.149"
 sha2 = "0.10.8"
-sqlx = {version = "0.8.6", features = ["runtime-tokio-native-tls", "postgres", "macros", "migrate", "uuid", "chrono", "json"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "macros", "migrate", "uuid", "chrono", "json"] }
 tokio = { version = "1.51.0", features = ["full"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 tokio-tungstenite = "0.29.0"

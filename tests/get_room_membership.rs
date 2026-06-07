@@ -1,7 +1,7 @@
 mod common;
 
 use common::*;
-use relay::model::PublicUser;
+use relay::model::RoomMember;
 use sqlx::PgPool;
 
 fn get_members_cmd(room: &str) -> ClientCommand {
@@ -10,7 +10,7 @@ fn get_members_cmd(room: &str) -> ClientCommand {
     }
 }
 
-fn usernames(members: &[PublicUser]) -> Vec<&str> {
+fn usernames(members: &[RoomMember]) -> Vec<&str> {
     members.iter().map(|m| m.username.as_str()).collect()
 }
 
@@ -36,6 +36,9 @@ async fn lists_members_owner_first(pool: PgPool) {
         ServerEvent::RoomMembers { members } => {
             // alice is the owner, so she sorts first.
             assert_eq!(usernames(&members), vec!["alice", "bob"]);
+            // Ownership is reflected per member.
+            assert!(members[0].is_owner, "alice should be an owner");
+            assert!(!members[1].is_owner, "bob should not be an owner");
         }
         other => panic!("expected RoomMembers, got {other:?}"),
     }
