@@ -330,6 +330,7 @@ async fn spawn_receiver_task(
                                         &write_semaphore,
                                         &user_tx,
                                         user_id,
+                                        &hub,
                                         &shutdown,
                                     )
                                     .await;
@@ -667,6 +668,25 @@ async fn process_message(
                     }
                     _ => {
                         tracing::debug!("remove_reaction: request failed");
+                        let _ = user_tx.send(ServerEvent::Failed).await;
+                    }
+                }
+            }
+
+            ClientCommand::DeleteMessage { message_id } => {
+                // The deleter is the authenticated session user; sender-or-admin auth
+                // happens inside the actor, which also fans out the MessageRemoved on
+                // success. A forbidden or unknown message collapses to a generic Failed.
+                let response = handles
+                    .message_handle
+                    .delete_message(user_id, message_id)
+                    .await;
+                match response {
+                    MessageResponse::Success => {
+                        let _ = user_tx.send(ServerEvent::Success).await;
+                    }
+                    _ => {
+                        tracing::debug!("delete_message: request failed");
                         let _ = user_tx.send(ServerEvent::Failed).await;
                     }
                 }
@@ -1241,6 +1261,7 @@ async fn process_message(
 //
 // Frame layout:
 // [attachment_id: 16B][seq: u32 big-endian: 4B][payload...]
+#[allow(clippy::too_many_arguments)]
 async fn process_binary(
     data: Vec<u8>,
     attachments: &mut HashMap<Uuid, AttachmentHandle>,
@@ -1248,6 +1269,7 @@ async fn process_binary(
     write_semaphore: &Arc<Semaphore>,
     user_tx: &tokio::sync::mpsc::Sender<ServerEvent>,
     user_id: Uuid,
+    hub: &Hub,
     shutdown: &CancellationToken,
 ) {
     const HEADER_LEN: usize = attachment::CHUNK_HEADER_LEN;
@@ -1309,8 +1331,8 @@ async fn process_binary(
     // Spawn-on-first-chunk / resume: confirm the caller is the sender of the
     // attachment's message and fetch the metadata needed to detect completion. One
     // ownership check per attachment, not per chunk.
-    let meta = sqlx::query_as::<_, (i32, i64, Vec<u8>, bool)>(
-        "SELECT a.chunk_count, a.size_bytes, a.content_sha256, a.is_complete
+    let meta = sqlx::query_as::<_, (i32, i64, Vec<u8>, String, bool)>(
+        "SELECT a.chunk_count, a.size_bytes, a.content_sha256, a.content_type, a.is_complete
             FROM message_attachments a
             JOIN messages m ON m.message_id = a.message_id
             WHERE a.attachment_id = $1 AND m.sender_id = $2",
@@ -1320,7 +1342,7 @@ async fn process_binary(
     .fetch_optional(pool)
     .await;
 
-    let (chunk_count, size_bytes, content_sha256, is_complete) = match meta {
+    let (chunk_count, size_bytes, content_sha256, content_type, is_complete) = match meta {
         Ok(Some(row)) => row,
         Ok(None) => {
             let _ = user_tx
@@ -1350,9 +1372,11 @@ async fn process_binary(
         chunk_count,
         size_bytes,
         content_sha256,
+        content_type,
         pool.clone(),
         write_semaphore.clone(),
         user_tx.clone(),
+        hub.clone(),
         shutdown.clone(),
     );
 

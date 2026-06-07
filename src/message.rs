@@ -38,6 +38,11 @@ pub enum MessageRequest {
         emoji: String,
         tx: oneshot::Sender<MessageResponse>,
     },
+    DeleteMessage {
+        user_id: Uuid,
+        message_id: Uuid,
+        tx: oneshot::Sender<MessageResponse>,
+    },
     GetMessages {
         user_id: Uuid,
         room_name: String,
@@ -161,6 +166,29 @@ impl MessageHandle {
                 user_id,
                 message_id,
                 emoji,
+                tx,
+            })
+            .await
+            .is_err()
+        {
+            return MessageResponse::Failed;
+        }
+
+        rx.await.unwrap_or(MessageResponse::Failed)
+    }
+
+    // Delete `message_id` on behalf of `user_id`, the authenticated caller.
+    // Authorization (own message or admin) is enforced in the actor; on success the
+    // removal is fanned out to the room. A forbidden or unknown message is a generic
+    // failure.
+    pub async fn delete_message(&self, user_id: Uuid, message_id: Uuid) -> MessageResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(MessageRequest::DeleteMessage {
+                user_id,
+                message_id,
                 tx,
             })
             .await
@@ -527,6 +555,64 @@ async fn handle_request(
             }
         }
 
+        MessageRequest::DeleteMessage {
+            user_id,
+            message_id,
+            tx,
+        } => {
+            // JIT auth: only the message's own sender or a server admin may delete
+            // it. Resolve the room (id + name for the broadcast) in the same gated
+            // statement, so a non-author non-admin -- and an unknown message -- both
+            // yield no row and the same generic failure, leaking neither the
+            // message's existence nor who is allowed to remove it. Re-checked per
+            // request rather than trusting the session's connect-time is_admin.
+            let room = sqlx::query_as::<_, (Uuid, String)>(
+                "SELECT r.room_id, r.room_name
+                    FROM messages m
+                    JOIN rooms r ON r.room_id = m.room_id
+                    WHERE m.message_id = $1
+                      AND (m.sender_id = $2
+                           OR EXISTS (SELECT 1 FROM admins a WHERE a.user_id = $2))",
+            )
+            .bind(message_id)
+            .bind(user_id)
+            .fetch_optional(&pool)
+            .await;
+
+            let (room_id, room_name) = match room {
+                Ok(Some(row)) => row,
+                Ok(None) => return (MessageResponse::Failed, tx),
+                Err(e) => {
+                    tracing::error!(error = %e, %message_id, "delete_message: auth lookup failed");
+                    return (MessageResponse::Failed, tx);
+                }
+            };
+
+            // Remove the message; its attachments (and their chunks) and reactions
+            // cascade via ON DELETE CASCADE.
+            if let Err(e) = sqlx::query("DELETE FROM messages WHERE message_id = $1")
+                .bind(message_id)
+                .execute(&pool)
+                .await
+            {
+                tracing::error!(error = %e, %message_id, "delete_message: delete failed");
+                return (MessageResponse::Failed, tx);
+            }
+
+            // Fan the removal out so every subscribed client drops it live. The
+            // caller's own session gets it too and removes the message like everyone
+            // else (there's no rejected-upload label to preserve for a deletion).
+            hub.publish(
+                room_id,
+                ServerEvent::MessageRemoved {
+                    room_name,
+                    message_id,
+                },
+            );
+
+            (MessageResponse::Success, tx)
+        }
+
         MessageRequest::GetMessages {
             user_id,
             room_name,
@@ -540,8 +626,8 @@ async fn handle_request(
                 .map(|l| (l as i64).clamp(1, MAX_HISTORY_LIMIT))
                 .unwrap_or(DEFAULT_HISTORY_LIMIT);
 
-            // JIT auth + name resolution: members only, existence hidden.
-            let room_id = match resolve_member_room(&pool, &room_name, user_id).await {
+            // JIT auth + name resolution: members or admins, existence hidden.
+            let room_id = match resolve_readable_room(&pool, &room_name, user_id).await {
                 Ok(Some(id)) => id,
                 Ok(None) => return (MessageResponse::Failed, tx),
                 Err(e) => {
@@ -659,6 +745,29 @@ async fn resolve_member_room(
             FROM rooms r
             JOIN memberships mb ON mb.room_id = r.room_id
             WHERE LOWER(r.room_name) = LOWER(trim_ws($1)) AND mb.user_id = $2",
+    )
+    .bind(room_name)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+}
+
+// Resolve a (normalized) room name to its id for a caller who may READ it: a
+// member, or an admin (who can read any room for moderation). A non-member
+// non-admin and an unknown room both yield None, so neither the room's existence
+// nor its membership leaks to anyone without read rights. Used by history reads.
+async fn resolve_readable_room(
+    pool: &PgPool,
+    room_name: &str,
+    user_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT r.room_id
+            FROM rooms r
+            WHERE LOWER(r.room_name) = LOWER(trim_ws($1))
+              AND (EXISTS (SELECT 1 FROM memberships mb
+                           WHERE mb.room_id = r.room_id AND mb.user_id = $2)
+                   OR EXISTS (SELECT 1 FROM admins a WHERE a.user_id = $2))",
     )
     .bind(room_name)
     .bind(user_id)

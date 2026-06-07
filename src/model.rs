@@ -50,6 +50,15 @@ pub enum ClientCommand {
         message_id: Uuid,
         emoji: String,
     },
+    // Permanently remove a message (an "unsend"). Allowed only for the message's
+    // own sender or a server admin; the check is server-side per request. On
+    // success the message -- with any attachments, their chunks, and reactions --
+    // is deleted and a MessageRemoved is fanned out to the room so every client
+    // drops it live. A forbidden or unknown message yields the same generic
+    // failure, so neither the message's existence nor who may delete it leaks.
+    DeleteMessage {
+        message_id: Uuid,
+    },
     // Page through a room's message history, newest first, each message carrying
     // its attachment metadata and reaction summary. Read access requires
     // membership of the room; a non-member and an unknown room yield the same
@@ -199,6 +208,13 @@ pub enum ServerEvent {
     AttachmentComplete {
         attachment_id: Uuid,
     },
+    // A fully-uploaded attachment failed the content-type policy (unsupported
+    // format, or declared type doesn't match the actual bytes) and was not
+    // published. Attachment-specific so the client can attribute it to the file.
+    AttachmentRejected {
+        attachment_id: Uuid,
+        reason: String,
+    },
     // Reply to GetMaxChunkSize: the largest chunk payload (file bytes, excluding
     // the frame header) the server will accept in one upload frame.
     MaxChunkSize {
@@ -243,6 +259,14 @@ pub enum ServerEvent {
     NewMessage {
         room_name: String,
         message: MessageHistoryItem,
+    },
+    // A message was removed server-side and should be dropped from the room view.
+    // Emitted for unsend/admin deletion and when a rejected upload leaves a
+    // message with no attachments, so it would otherwise linger as a bare filename
+    // or caption for everyone in the room.
+    MessageRemoved {
+        room_name: String,
+        message_id: Uuid,
     },
     // The session fell behind a room's live buffer and dropped events. Not an
     // error -- a hint to re-fetch that room from history (GetMessages); the read

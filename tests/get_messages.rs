@@ -227,6 +227,25 @@ async fn non_member_is_denied_and_room_existence_hidden(pool: PgPool) {
     }
 }
 
+// An admin can read history in a private room they're not a member of, so they
+// can moderate any room's content.
+#[sqlx::test]
+async fn admin_reads_non_member_room(pool: PgPool) {
+    seed_admin(&pool, "admin", "adminpw").await;
+    seed_user(&pool, "alice", "alicepw").await;
+    seed_room(&pool, "vault", "alice", false, false).await;
+    let server = spawn_app(pool.clone(), |_| {}).await;
+
+    let mut alice = login(&server, "alice", "alicepw").await;
+    post(&mut alice, "vault", "members only").await;
+    post(&mut alice, "vault", "still here").await;
+
+    // admin is not a member, but reads the full history anyway.
+    let mut admin = login(&server, "admin", "adminpw").await;
+    let page = history(&mut admin, "vault", None, None).await;
+    assert_eq!(contents(&page), vec!["still here", "members only"]);
+}
+
 #[sqlx::test]
 async fn deleted_sender_falls_back_to_snapshot(pool: PgPool) {
     seed_user(&pool, "alice", "alicepw").await;
