@@ -12,6 +12,11 @@ use uuid::Uuid;
 
 use crate::model::{self, Admin, EditUser, NewCredential, NewUser, Password, User};
 
+// Directory page size when the client doesn't ask, and the hard cap when it does
+// -- bounds one GetUsers response so a large user base can't be pulled at once.
+const DEFAULT_USER_PAGE: i64 = 50;
+const MAX_USER_PAGE: i64 = 100;
+
 pub enum UserRequest {
     NewUserRequest {
         user: model::NewUser,
@@ -24,6 +29,13 @@ pub enum UserRequest {
     },
     GetUserByUsername {
         username: String,
+        tx: oneshot::Sender<UserResponse>,
+    },
+    GetUsers {
+        source_user_id: Uuid,
+        starts_with: Option<String>,
+        after: Option<String>,
+        limit: Option<u32>,
         tx: oneshot::Sender<UserResponse>,
     },
     IsAdminRequest {
@@ -70,10 +82,23 @@ pub enum UserRequest {
 
 #[derive(Debug)]
 pub enum UserResponse {
-    UserCreated { user_id: Uuid },
-    UserInfo { user_info: User },
-    IsAdmin { is_admin: bool },
-    UserDeleted { is_self: bool },
+    UserCreated {
+        user_id: Uuid,
+    },
+    UserInfo {
+        user_info: User,
+    },
+    IsAdmin {
+        is_admin: bool,
+    },
+    UserDeleted {
+        is_self: bool,
+    },
+    // One page of the user directory, plus whether another page follows.
+    Users {
+        users: Vec<model::UserDirectoryEntry>,
+        has_more: bool,
+    },
     NoChange,
     NoUserExists,
     Success,
@@ -187,6 +212,35 @@ impl UserHandle {
             .is_err()
         {
             tracing::error!("user actor unavailable: get_user_by_username request dropped");
+            return UserResponse::Failed;
+        }
+
+        rx.await.unwrap_or(UserResponse::Failed)
+    }
+
+    // Page the user directory on behalf of `source_user_id`. The caller's admin
+    // status (which gates the per-entry `is_admin` flag) is resolved in the actor.
+    pub async fn get_users(
+        &self,
+        source_user_id: Uuid,
+        starts_with: Option<String>,
+        after: Option<String>,
+        limit: Option<u32>,
+    ) -> UserResponse {
+        let (tx, rx) = oneshot::channel();
+
+        if self
+            .sender
+            .send(UserRequest::GetUsers {
+                source_user_id,
+                starts_with,
+                after,
+                limit,
+                tx,
+            })
+            .await
+            .is_err()
+        {
             return UserResponse::Failed;
         }
 
@@ -449,6 +503,30 @@ async fn handle_request(
                 Ok(res) => (res, tx),
                 Err(e) => {
                     tracing::error!(error = %e, "get_user_by_username: query failed");
+                    (UserResponse::Failed, tx)
+                }
+            }
+        }
+
+        UserRequest::GetUsers {
+            source_user_id,
+            starts_with,
+            after,
+            limit,
+            tx,
+        } => {
+            let mut db = match pool.acquire().await {
+                Ok(db) => db,
+                Err(e) => {
+                    tracing::error!(error = %e, "get_users: acquire connection failed");
+                    return (UserResponse::Failed, tx);
+                }
+            };
+
+            match get_users(&mut db, source_user_id, starts_with, after, limit).await {
+                Ok(res) => (res, tx),
+                Err(e) => {
+                    tracing::error!(error = %e, "get_users: query failed");
                     (UserResponse::Failed, tx)
                 }
             }
@@ -1002,6 +1080,89 @@ async fn get_user_by_username(
         Some(user) => Ok(UserResponse::UserInfo { user_info: user }),
         None => Ok(UserResponse::NoUserExists),
     }
+}
+
+// One row of a directory page as it comes back from the DB. `is_admin` is always
+// computed here; whether it's *revealed* to the caller is decided in `get_users`.
+#[derive(sqlx::FromRow)]
+struct DirectoryRow {
+    first_name: Option<String>,
+    last_name: Option<String>,
+    alias: Option<String>,
+    username: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    is_admin: bool,
+}
+
+// Escape the LIKE metacharacters (`\`, `%`, `_`) in a user-supplied prefix so they
+// match literally rather than as wildcards. Backslash is escaped first so the
+// escapes we add aren't themselves re-escaped. Pairs with `ESCAPE '\'` in the query.
+fn escape_like(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+// Page the user directory, ordered by username (case-insensitive), with an
+// optional prefix filter and a keyset cursor. Fetches one extra row to report
+// `has_more` without a second count query. The per-entry `is_admin` flag is only
+// populated when the caller is themselves an admin; for a regular caller it is
+// None (and omitted on the wire), so admin status isn't leaked to non-admins.
+async fn get_users(
+    db: &mut PgConnection,
+    source_user_id: Uuid,
+    starts_with: Option<String>,
+    after: Option<String>,
+    limit: Option<u32>,
+) -> Result<UserResponse, sqlx::Error> {
+    // Clamp the page size: default when unset, hard cap, floor 1 so a request
+    // always makes progress. Fetch one extra to detect a following page.
+    let limit = limit
+        .map(|l| (l as i64).clamp(1, MAX_USER_PAGE))
+        .unwrap_or(DEFAULT_USER_PAGE);
+    let fetch = limit + 1;
+
+    // Normalize the optional prefix: trim, drop if empty, then escape LIKE
+    // metacharacters so a literal `%`/`_` in the prefix isn't treated as a wildcard.
+    let prefix = starts_with
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .map(|s| escape_like(&s));
+
+    // Reveal admin status only to an admin caller (the admin-pane use case).
+    let caller_is_admin = is_admin(&mut *db, source_user_id).await?;
+
+    let rows = sqlx::query_as::<_, DirectoryRow>(
+        "SELECT u.first_name, u.last_name, u.alias, u.username, u.created_at,
+                EXISTS (SELECT 1 FROM admins a WHERE a.user_id = u.user_id) AS is_admin
+            FROM users u
+            WHERE ($1::text IS NULL OR LOWER(u.username) LIKE LOWER($1) || '%' ESCAPE '\\')
+              AND ($2::text IS NULL OR LOWER(u.username) > LOWER($2))
+            ORDER BY LOWER(u.username) ASC
+            LIMIT $3",
+    )
+    .bind(prefix.as_deref())
+    .bind(after.as_deref())
+    .bind(fetch)
+    .fetch_all(&mut *db)
+    .await?;
+
+    let has_more = rows.len() as i64 > limit;
+    let users = rows
+        .into_iter()
+        .take(limit as usize)
+        .map(|r| model::UserDirectoryEntry {
+            first_name: r.first_name,
+            last_name: r.last_name,
+            alias: r.alias,
+            username: r.username,
+            created_at: r.created_at,
+            is_admin: caller_is_admin.then_some(r.is_admin),
+        })
+        .collect();
+
+    Ok(UserResponse::Users { users, has_more })
 }
 
 async fn create_admin(

@@ -93,6 +93,24 @@ pub enum ClientCommand {
     GetUserByUsername {
         username: String,
     },
+    // Page through the user directory, ordered by username. Open to any
+    // authenticated user (e.g. to find someone to invite without knowing their
+    // exact handle). Answered with `Users`.
+    //
+    // - `starts_with`: optional case-insensitive username prefix filter. Empty or
+    //   whitespace-only is treated as no filter.
+    // - `after`: keyset cursor -- the `username` of the last entry from the
+    //   previous page; the next page continues with usernames ordered after it.
+    //   Omit for the first page.
+    // - `limit`: page size, clamped server-side (defaults applied, hard cap).
+    GetUsers {
+        #[serde(default)]
+        starts_with: Option<String>,
+        #[serde(default)]
+        after: Option<String>,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
     EditUser {
         target_username: String,
         username: Option<String>,
@@ -142,8 +160,17 @@ pub enum ClientCommand {
     LeaveRoom {
         room_name: String,
     },
+    // Owner/admin removes another user's membership from a room.
+    RemoveRoomMember {
+        room_name: String,
+        member_username: String,
+    },
     // The caller's own outstanding join requests.
     GetMyJoinRequests,
+    // The caller withdraws their own pending join request.
+    CancelJoinRequest {
+        room_name: String,
+    },
     // Pending join requests for rooms the caller owns (or any room, if admin).
     GetIncomingJoinRequests,
     ApproveJoinRequest {
@@ -171,6 +198,12 @@ pub enum ClientCommand {
     // prelude (before auth) so a client can decide whether to offer registration,
     // and also after auth. Reply: SignupStatus.
     GetSignupStatus,
+    // Returns all rooms that are publicly listed (is_discoverable = true or is_public = true),
+    // so a client can show a room browser without knowing room names in advance.
+    ListDiscoverableRooms,
+    // Admin only: returns every room (including private, non-discoverable ones) so
+    // an admin can browse and moderate any room. Non-admins are rejected.
+    ListAllRooms,
     // Restart the entire server process: drain every connection and actor, then
     // re-initialize from a fresh config. Admin only. The issuing connection is torn
     // down with the rest, so the client should expect its socket to close shortly
@@ -292,7 +325,7 @@ pub enum ServerEvent {
         created_at: DateTime<Utc>,
     },
     RoomMembers {
-        members: Vec<PublicUser>,
+        members: Vec<RoomMember>,
     },
     RoomInfo {
         room_name: String,
@@ -307,6 +340,20 @@ pub enum ServerEvent {
     },
     MyInvites {
         rooms: Vec<String>,
+    },
+    DiscoverableRooms {
+        rooms: Vec<DiscoverableRoom>,
+    },
+    // Reply to ListAllRooms (admin): every room with a live member count.
+    AllRooms {
+        rooms: Vec<DiscoverableRoom>,
+    },
+    // Reply to GetUsers: one page of the user directory, ordered by username.
+    // `has_more` is true when another page exists after this one (continue by
+    // passing the last entry's `username` as the next `after` cursor).
+    Users {
+        users: Vec<UserDirectoryEntry>,
+        has_more: bool,
     },
     NoChange,
     NoUserExists,
@@ -370,6 +417,34 @@ pub struct PublicUser {
     pub created_at: DateTime<Utc>,
 }
 
+// One entry in a GetUsers directory page: the public profile fields plus an
+// optional admin flag. `is_admin` is populated only when the *requesting* user is
+// an admin (the admin pane's "identify other admins"); for a regular caller it is
+// None and omitted from the wire, so admin status isn't exposed to non-admins.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct UserDirectoryEntry {
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub alias: Option<String>,
+    pub username: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_admin: Option<bool>,
+}
+
+// A room member as shown to clients: the public profile fields plus whether the
+// user is an owner of the room (memberships.is_owner), so the client can render
+// ownership and gate owner-only actions.
+#[derive(sqlx::FromRow, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RoomMember {
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub alias: Option<String>,
+    pub username: String,
+    pub created_at: DateTime<Utc>,
+    pub is_owner: bool,
+}
+
 #[derive(sqlx::FromRow)]
 pub struct Admin {
     pub user_id: Uuid,
@@ -421,6 +496,13 @@ pub struct NewRoom {
     pub owner_id: Uuid,
     pub is_public: bool,
     pub is_discoverable: bool,
+}
+
+#[derive(sqlx::FromRow, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DiscoverableRoom {
+    pub room_name: String,
+    pub is_public: bool,
+    pub member_count: i64,
 }
 
 #[derive(sqlx::FromRow)]

@@ -237,3 +237,42 @@ async fn approval_subscribes_an_online_requester(pool: PgPool) {
     assert_eq!(message.message_id, message_id);
     assert_eq!(message.content, "welcome aboard");
 }
+
+// The mirror of the approval case: removing a member pushes a Subscription::Remove
+// to that member's open session (cross-session, via the hub), so their live feed
+// for the room is cut immediately -- a message posted after removal never arrives.
+#[sqlx::test]
+async fn removed_member_stops_receiving_live(pool: PgPool) {
+    seed_user(&pool, "alice", "alicepw").await;
+    seed_user(&pool, "bob", "bobpw").await;
+    seed_room(&pool, "vault", "alice", false, false).await;
+    seed_membership(&pool, "vault", "bob").await;
+    let server = spawn_app(pool.clone(), |_| {}).await;
+
+    let mut alice = connect(&server, "alice", "alicepw").await;
+    let mut bob = connect(&server, "bob", "bobpw").await;
+
+    // Baseline: bob receives a live message while still a member.
+    let before = post(&mut alice, "vault", "before").await;
+    let (_, message) = recv_new_message(&mut bob).await;
+    assert_eq!(message.message_id, before);
+
+    // Owner removes bob.
+    send_cmd(
+        &mut alice,
+        &ClientCommand::RemoveRoomMember {
+            room_name: "vault".to_owned(),
+            member_username: "bob".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(next_reply(&mut alice).await, ServerEvent::Success);
+
+    // Let bob's sender task process the unsubscribe before the next post, so the
+    // broadcast can't race ahead of the stream removal.
+    sleep(Duration::from_millis(200)).await;
+
+    // A message posted after removal must not reach bob's now-unsubscribed session.
+    post(&mut alice, "vault", "after").await;
+    assert_no_event(&mut bob, Duration::from_millis(400)).await;
+}

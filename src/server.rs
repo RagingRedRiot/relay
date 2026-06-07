@@ -846,6 +846,28 @@ async fn process_message(
                 }
             }
 
+            ClientCommand::GetUsers {
+                starts_with,
+                after,
+                limit,
+            } => {
+                // Open to any authenticated user; the caller's admin status (which
+                // gates the per-entry is_admin flag) is resolved inside the actor.
+                match handles
+                    .user_handle
+                    .get_users(user_id, starts_with, after, limit)
+                    .await
+                {
+                    UserResponse::Users { users, has_more } => {
+                        let _ = user_tx.send(ServerEvent::Users { users, has_more }).await;
+                    }
+                    _ => {
+                        tracing::debug!("get_users: request failed");
+                        let _ = user_tx.send(ServerEvent::Failed).await;
+                    }
+                }
+            }
+
             ClientCommand::DeleteUser { target_username } => {
                 match handles
                     .user_handle
@@ -1086,10 +1108,49 @@ async fn process_message(
                 }
             }
 
+            ClientCommand::RemoveRoomMember {
+                room_name,
+                member_username,
+            } => {
+                match handles
+                    .room_handle
+                    .remove_room_member(user_id, room_name, member_username)
+                    .await
+                {
+                    crate::room::RoomResponse::Success => {
+                        let _ = user_tx.send(ServerEvent::Success).await;
+                    }
+                    crate::room::RoomResponse::NoChange => {
+                        let _ = user_tx.send(ServerEvent::NoChange).await;
+                    }
+                    _ => {
+                        let _ = user_tx.send(ServerEvent::Failed).await;
+                    }
+                }
+            }
+
             ClientCommand::GetMyJoinRequests => {
                 match handles.room_handle.get_my_join_requests(user_id).await {
                     crate::room::RoomResponse::MyJoinRequests { rooms } => {
                         let _ = user_tx.send(ServerEvent::MyJoinRequests { rooms }).await;
+                    }
+                    _ => {
+                        let _ = user_tx.send(ServerEvent::Failed).await;
+                    }
+                }
+            }
+
+            ClientCommand::CancelJoinRequest { room_name } => {
+                match handles
+                    .room_handle
+                    .cancel_join_request(user_id, room_name)
+                    .await
+                {
+                    crate::room::RoomResponse::Success => {
+                        let _ = user_tx.send(ServerEvent::Success).await;
+                    }
+                    crate::room::RoomResponse::NoChange => {
+                        let _ = user_tx.send(ServerEvent::NoChange).await;
                     }
                     _ => {
                         let _ = user_tx.send(ServerEvent::Failed).await;
@@ -1215,6 +1276,28 @@ async fn process_message(
                     }
                     crate::room::RoomResponse::NoChange => {
                         let _ = user_tx.send(ServerEvent::NoChange).await;
+                    }
+                    _ => {
+                        let _ = user_tx.send(ServerEvent::Failed).await;
+                    }
+                }
+            }
+
+            ClientCommand::ListDiscoverableRooms => {
+                match handles.room_handle.list_discoverable_rooms().await {
+                    crate::room::RoomResponse::DiscoverableRooms { rooms } => {
+                        let _ = user_tx.send(ServerEvent::DiscoverableRooms { rooms }).await;
+                    }
+                    _ => {
+                        let _ = user_tx.send(ServerEvent::Failed).await;
+                    }
+                }
+            }
+
+            ClientCommand::ListAllRooms => {
+                match handles.room_handle.list_all_rooms(user_id).await {
+                    crate::room::RoomResponse::AllRooms { rooms } => {
+                        let _ = user_tx.send(ServerEvent::AllRooms { rooms }).await;
                     }
                     _ => {
                         let _ = user_tx.send(ServerEvent::Failed).await;

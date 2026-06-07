@@ -121,6 +121,26 @@ impl Hub {
             });
         }
     }
+
+    // Drop `room_id`'s live stream from every currently-connected session of
+    // `user_id`. The mirror of subscribe_user_to_room: used when a user is removed
+    // from a room by someone else (a kick), so their open sessions stop receiving
+    // the room's messages immediately rather than at their next reconnect. A closed
+    // session's send simply fails; it's cleaned up when that session's guard
+    // deregisters. Offline users have no sessions and re-subscribe (as a member)
+    // only if re-admitted.
+    pub fn unsubscribe_user_from_room(&self, user_id: Uuid, room_id: Uuid) {
+        let senders: Vec<mpsc::Sender<Subscription>> = {
+            let sessions = self.sessions.lock().unwrap();
+            match sessions.get(&user_id) {
+                Some(entries) => entries.iter().map(|e| e.sub_tx.clone()).collect(),
+                None => return,
+            }
+        };
+        for sub_tx in senders {
+            let _ = sub_tx.try_send(Subscription::Remove { room_id });
+        }
+    }
 }
 
 // Deregisters a session from the Hub's presence registry when dropped, so a session
