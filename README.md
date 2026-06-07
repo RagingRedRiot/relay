@@ -79,7 +79,15 @@ Deleting a user cascades to credentials, admin grant, and memberships but preser
 
 ## Running locally
 
-Requirements: Rust (edition 2024) and a running Postgres instance.
+Requirements: Rust (edition 2024), a running Postgres instance, and Node.js + npm (to build the embedded web client).
+
+> **Build the frontend first.** The binary embeds `frontend/dist/` at compile time via `rust-embed`, and that directory is gitignored — a fresh clone must produce it before the server will compile. Build it once with `make build` (runs `npm run build`, then `cargo build --release`), or manually:
+>
+> ```bash
+> cd frontend && npm install && npm run build && cd ..
+> ```
+>
+> After `frontend/dist/` exists, the steps below work. `build.rs` marks it as a Cargo input, so a later `npm run build` triggers a rebuild of the binary that embeds it. To serve a client from disk instead of the embedded copy at runtime, set `FRONTEND_DIR` (the embed folder must still exist for compilation).
 
 ```bash
 cp .env.example .env
