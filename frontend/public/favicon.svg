@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">Relay favicon</title>
+  <desc id="desc">A hexagonal relay node with bidirectional message flow.</desc>
+  <defs>
+    <linearGradient id="bg" x1="12" y1="8" x2="52" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#0c1117"/>
+    </linearGradient>
+    <linearGradient id="relay" x1="18" y1="16" x2="46" y2="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#0ea5e9"/>
+    </linearGradient>
+    <filter id="softGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="1.3" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="64" height="64" rx="14" fill="url(#bg)"/>
+
+  <!-- outer relay cell -->
+  <path
+    d="M32 8.5 52.4 20.25v23.5L32 55.5 11.6 43.75v-23.5L32 8.5Z"
+    fill="#0f172a"
+    stroke="#334155"
+    stroke-width="2.5"
+    stroke-linejoin="round"
+  />
+
+  <!-- subtle inner cell -->
+  <path
+    d="M32 14.5 47.2 23.25v17.5L32 49.5 16.8 40.75v-17.5L32 14.5Z"
+    fill="none"
+    stroke="#1e3a4d"
+    stroke-width="1.5"
+    stroke-linejoin="round"
+  />
+
+  <!-- bidirectional relay flow -->
+  <g filter="url(#softGlow)" fill="none" stroke="url(#relay)" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 28.5h17.7" stroke-width="4"/>
+    <path d="M35.8 23.9 41.2 28.5l-5.4 4.6" stroke-width="4"/>
+    <path d="M43 36H25.3" stroke-width="4"/>
+    <path d="M28.2 31.4 22.8 36l5.4 4.6" stroke-width="4"/>
+  </g>
+
+  <!-- terminal nodes -->
+  <circle cx="20.5" cy="28.5" r="2.6" fill="#e0f2fe"/>
+  <circle cx="43.5" cy="36" r="2.6" fill="#e0f2fe"/>
+</svg>

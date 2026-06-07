@@ -57,10 +57,6 @@ fn serve_asset(path: &str) -> Response {
     }
 }
 
-pub(crate) async fn no_content() -> StatusCode {
-    StatusCode::NO_CONTENT
-}
-
 pub(crate) async fn ok() -> StatusCode {
     StatusCode::OK
 }

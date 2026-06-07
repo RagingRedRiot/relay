@@ -14,7 +14,7 @@ use crate::{
     auth::AuthHandle,
     config::Config,
     control::ServerControl,
-    handler::{embedded_asset, no_content, ok, ws_handler},
+    handler::{embedded_asset, ok, ws_handler},
     hub::Hub,
     message::{self, MessageHandle},
     room::{self, RoomHandle},
@@ -82,7 +82,6 @@ pub async fn app(
 
     let router = Router::new()
         .route("/health", get(ok))
-        .route("/favicon.ico", get(no_content))
         .route("/ws", any(ws_handler))
         .layer(GovernorLayer::new(governor_conf))
         .with_state(state);
