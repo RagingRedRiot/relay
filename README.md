@@ -1,5 +1,7 @@
 # Relay
 
+![Relay banner](docs/assets/relay-banner.png)
+
 A self-hosted real-time chat platform written in async Rust.
 
 > **Status:** Early development. Not production ready.
