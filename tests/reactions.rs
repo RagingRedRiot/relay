@@ -16,11 +16,10 @@ async fn post_message(
     let mut ws = create_socket(server.addr).await;
     authenticate(&mut ws, username, password).await;
 
-    let room_id = room_id(&server.pool, room_name).await;
     send_cmd(
         &mut ws,
         &ClientCommand::SendMessage {
-            room_id,
+            room_name: room_name.to_owned(),
             content: "hello".to_owned(),
             attachments: vec![],
         },

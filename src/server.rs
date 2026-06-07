@@ -206,15 +206,16 @@ async fn spawn_receiver_task(
             &mut receiver,
             &auth_handle,
             &handles.user_handle,
+            &user_tx,
             open_signups,
         )
         .await;
 
         match server_event {
-            ServerEvent::AuthOk => {
+            ServerEvent::AuthOk { is_admin } => {
                 tracing::Span::current().record("user_id", tracing::field::display(user_id));
                 tracing::debug!("session authenticated");
-                let _ = user_tx.send(ServerEvent::AuthOk).await;
+                let _ = user_tx.send(ServerEvent::AuthOk { is_admin }).await;
             }
             // Anything but AuthOk results in shutdown
             ServerEvent::NoAuth => {
@@ -549,10 +550,30 @@ async fn process_message(
             }
 
             ClientCommand::SendMessage {
-                room_id,
+                room_name,
                 content,
                 attachments,
             } => {
+                // Resolve the caller-supplied room name to a UUID for the
+                // internal message actor (which keys everything by room_id).
+                let room_id = match sqlx::query_scalar::<_, Uuid>(
+                    "SELECT room_id FROM rooms WHERE LOWER(room_name) = LOWER(trim_ws($1))",
+                )
+                .bind(&room_name)
+                .fetch_optional(pool)
+                .await
+                {
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        let _ = user_tx.send(ServerEvent::Failed).await;
+                        return ControlFlow::Continue(());
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "send_message: room name lookup failed");
+                        let _ = user_tx.send(ServerEvent::Failed).await;
+                        return ControlFlow::Continue(());
+                    }
+                };
                 // The sender is the authenticated session user, never taken from
                 // the client. Membership auth happens inside the actor's
                 // transaction. On success the client gets the new message_id plus
@@ -606,6 +627,13 @@ async fn process_message(
                     .send(ServerEvent::MaxChunkSize {
                         bytes: max_chunk_bytes,
                     })
+                    .await;
+            }
+
+            ClientCommand::GetSignupStatus => {
+                // Public server setting; also answerable in the prelude (pre-auth).
+                let _ = user_tx
+                    .send(ServerEvent::SignupStatus { open_signups })
                     .await;
             }
 
@@ -1362,76 +1390,110 @@ async fn new_user(
         .await
 }
 
+// Largest number of pre-auth frames a client may send before it must Auth/NewUser.
+// Only GetSignupStatus is non-terminal, so this caps a flood of signup-status
+// queries on an unauthenticated socket, where the per-session limiter isn't active.
+const MAX_PRELUDE_FRAMES: u32 = 16;
+
 async fn prelude(
     receiver: &mut SplitStream<WebSocket>,
     auth_handle: &AuthHandle,
     user_handle: &UserHandle,
+    user_tx: &mpsc::Sender<ServerEvent>,
     open_signups: bool,
 ) -> (Uuid, ServerEvent) {
-    tokio::select! {
-        maybe_auth = receiver.next() => {
-            match maybe_auth {
-                Some(Ok(Message::Text(t))) => {
-                    match serde_json::from_str::<ClientCommand>(&t) {
-                        Ok(ClientCommand::Auth{username, password}) => {
-                            // Clone the username for audit logging; authenticate consumes it.
-                            match auth_handle.authenticate(username.clone(), password).await {
-                                AuthResult::Ok { user_id } => {
-                                    tracing::info!(target: crate::logging::AUDIT, %user_id, username = %username, "login succeeded");
-                                    (user_id, ServerEvent::AuthOk)
-                                }
-                                AuthResult::Failed => {
-                                    tracing::warn!(target: crate::logging::AUDIT, username = %username, "login failed");
-                                    (Uuid::nil(), ServerEvent::NoAuth)
-                                }
-                                // Server-side fault, not a credential rejection: already
-                                // logged at error! in the auth actor, so don't audit it
-                                // as a failed login.
-                                AuthResult::Error => (Uuid::nil(), ServerEvent::NoAuth),
+    // The prelude loops only for a GetSignupStatus query (answered, then it keeps
+    // waiting). Auth / NewUser / any other frame returns a terminal outcome and ends
+    // it, exactly as before — so a first Auth/NewUser frame behaves unchanged.
+    let mut frames: u32 = 0;
+    loop {
+        frames += 1;
+        if frames > MAX_PRELUDE_FRAMES {
+            tracing::debug!("prelude frame cap exceeded without auth");
+            return (Uuid::nil(), ServerEvent::NoAuth);
+        }
+
+        let maybe_auth = receiver.next().await;
+        return match maybe_auth {
+            Some(Ok(Message::Text(t))) => {
+                match serde_json::from_str::<ClientCommand>(&t) {
+                    // Pre-auth query: answer and keep waiting for Auth/NewUser.
+                    Ok(ClientCommand::GetSignupStatus) => {
+                        let _ = user_tx
+                            .send(ServerEvent::SignupStatus { open_signups })
+                            .await;
+                        continue;
+                    }
+                    Ok(ClientCommand::Auth { username, password }) => {
+                        // Clone the username for audit logging; authenticate consumes it.
+                        match auth_handle.authenticate(username.clone(), password).await {
+                            AuthResult::Ok { user_id } => {
+                                tracing::info!(target: crate::logging::AUDIT, %user_id, username = %username, "login succeeded");
+                                let is_admin = user_handle.is_admin(user_id).await;
+                                (user_id, ServerEvent::AuthOk { is_admin })
                             }
-                        },
-                        // Unauthenticated user creation is only allowed when open
-                        // signups are enabled in the config; otherwise reject it.
-                        Ok(ClientCommand::NewUser { username, .. }) if !open_signups => {
-                            tracing::warn!(target: crate::logging::AUDIT, username = %username, "signup rejected: open signups disabled");
-                            (Uuid::nil(), ServerEvent::NoAuth)
+                            AuthResult::Failed => {
+                                tracing::warn!(target: crate::logging::AUDIT, username = %username, "login failed");
+                                (Uuid::nil(), ServerEvent::NoAuth)
+                            }
+                            // Server-side fault, not a credential rejection: already
+                            // logged at error! in the auth actor, so don't audit it
+                            // as a failed login.
+                            AuthResult::Error => (Uuid::nil(), ServerEvent::NoAuth),
                         }
-                        Ok(ClientCommand::NewUser {
-                            username,
+                    }
+                    // Unauthenticated user creation is only allowed when open
+                    // signups are enabled in the config; otherwise reject it.
+                    Ok(ClientCommand::NewUser { username, .. }) if !open_signups => {
+                        tracing::warn!(target: crate::logging::AUDIT, username = %username, "signup rejected: open signups disabled");
+                        (Uuid::nil(), ServerEvent::NoAuth)
+                    }
+                    Ok(ClientCommand::NewUser {
+                        username,
+                        password,
+                        first_name,
+                        last_name,
+                        alias,
+                    }) => {
+                        // Clone the username for audit logging; new_user consumes it.
+                        match new_user(
+                            user_handle,
+                            username.clone(),
                             password,
                             first_name,
                             last_name,
-                            alias
-                        }) => {
-                            // Clone the username for audit logging; new_user consumes it.
-                            match new_user(user_handle, username.clone(), password, first_name, last_name, alias).await {
-                                // Account-creation audit happens in the user actor (the
-                                // single point both signup and authenticated paths hit).
-                                UserResponse::UserCreated { user_id } => (user_id, ServerEvent::UserCreated),
-                                UserResponse::Failed => {
-                                    // Detailed cause is logged in the user actor; this is just the prelude outcome.
-                                    tracing::debug!(username = %username, "open-signup user creation failed");
-                                    (Uuid::nil(), ServerEvent::Failed)
-                                }
-                                _ => {
-                                    tracing::debug!(username = %username, "open-signup user creation returned unexpected response");
-                                    (Uuid::nil(), ServerEvent::Failed)
-                                }
+                            alias,
+                        )
+                        .await
+                        {
+                            // Account-creation audit happens in the user actor (the
+                            // single point both signup and authenticated paths hit).
+                            UserResponse::UserCreated { user_id } => {
+                                (user_id, ServerEvent::UserCreated)
                             }
-                        },
-                        Err(e) => {
-                            tracing::debug!(error = %e, "undecodable command during prelude");
-                            (Uuid::nil(), ServerEvent::NoAuth)
+                            UserResponse::Failed => {
+                                // Detailed cause is logged in the user actor; this is just the prelude outcome.
+                                tracing::debug!(username = %username, "open-signup user creation failed");
+                                (Uuid::nil(), ServerEvent::Failed)
+                            }
+                            _ => {
+                                tracing::debug!(username = %username, "open-signup user creation returned unexpected response");
+                                (Uuid::nil(), ServerEvent::Failed)
+                            }
                         }
-                        _ => (Uuid::nil(), ServerEvent::NoAuth)
                     }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "undecodable command during prelude");
+                        (Uuid::nil(), ServerEvent::NoAuth)
+                    }
+                    _ => (Uuid::nil(), ServerEvent::NoAuth),
                 }
-                Some(Err(e)) => {
-                    tracing::debug!(error = %e, "websocket error during prelude");
-                    (Uuid::nil(), ServerEvent::NoAuth)
-                }
-                _ => (Uuid::nil(), ServerEvent::NoAuth)
             }
-        }
+            Some(Err(e)) => {
+                tracing::debug!(error = %e, "websocket error during prelude");
+                (Uuid::nil(), ServerEvent::NoAuth)
+            }
+            _ => (Uuid::nil(), ServerEvent::NoAuth),
+        };
     }
 }

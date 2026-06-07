@@ -225,7 +225,10 @@ pub async fn authenticate(ws: &mut Ws, username: &str, password: &str) {
         },
     )
     .await;
-    assert_eq!(next_event(ws).await, ServerEvent::AuthOk);
+    assert!(
+        matches!(next_event(ws).await, ServerEvent::AuthOk { .. }),
+        "expected AuthOk",
+    );
 }
 
 // Gracefully close the socket; reaching the Close frame proves the

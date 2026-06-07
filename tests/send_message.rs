@@ -6,12 +6,12 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 fn send_message_cmd(
-    room_id: Uuid,
+    room_name: &str,
     content: &str,
     attachments: Vec<NewMessageAttachment>,
 ) -> ClientCommand {
     ClientCommand::SendMessage {
-        room_id,
+        room_name: room_name.to_owned(),
         content: content.to_owned(),
         attachments,
     }
@@ -37,7 +37,7 @@ async fn member_can_post_plain_message(pool: PgPool) {
     authenticate(&mut ws, "alice", "alicepw").await;
 
     let rid = room_id(&pool, "general").await;
-    send_cmd(&mut ws, &send_message_cmd(rid, "hello world", vec![])).await;
+    send_cmd(&mut ws, &send_message_cmd("general", "hello world", vec![])).await;
 
     match next_reply(&mut ws).await {
         ServerEvent::MessageCreated {
@@ -79,12 +79,15 @@ async fn attachments_are_created_incomplete_in_order(pool: PgPool) {
     let mut ws = create_socket(server.addr).await;
     authenticate(&mut ws, "alice", "alicepw").await;
 
-    let rid = room_id(&pool, "general").await;
     let attachments = vec![
         attachment("first.bin", 2, 1024),
         attachment("second.bin", 5, 4096),
     ];
-    send_cmd(&mut ws, &send_message_cmd(rid, "see files", attachments)).await;
+    send_cmd(
+        &mut ws,
+        &send_message_cmd("general", "see files", attachments),
+    )
+    .await;
 
     let (message_id, attachment_ids) = match next_reply(&mut ws).await {
         ServerEvent::MessageCreated {
@@ -135,7 +138,7 @@ async fn non_member_cannot_post(pool: PgPool) {
     authenticate(&mut ws, "mallory", "mallorypw").await;
 
     let rid = room_id(&pool, "secret").await;
-    send_cmd(&mut ws, &send_message_cmd(rid, "let me in", vec![])).await;
+    send_cmd(&mut ws, &send_message_cmd("secret", "let me in", vec![])).await;
     assert_eq!(next_reply(&mut ws).await, ServerEvent::Failed);
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE room_id = $1")
@@ -156,10 +159,7 @@ async fn unknown_room_is_indistinguishable_from_forbidden(pool: PgPool) {
     let mut ws = create_socket(server.addr).await;
     authenticate(&mut ws, "alice", "alicepw").await;
 
-    // A room that doesn't exist: same generic Failed as a forbidden room, so
-    // existence isn't leaked.
-    let missing = Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").unwrap();
-    send_cmd(&mut ws, &send_message_cmd(missing, "anyone?", vec![])).await;
+    send_cmd(&mut ws, &send_message_cmd("missing", "anyone?", vec![])).await;
     assert_eq!(next_reply(&mut ws).await, ServerEvent::Failed);
 
     close_socket(&mut ws).await;
@@ -174,13 +174,12 @@ async fn empty_content_is_rejected_and_session_survives(pool: PgPool) {
     let mut ws = create_socket(server.addr).await;
     authenticate(&mut ws, "alice", "alicepw").await;
 
-    let rid = room_id(&pool, "general").await;
     // Empty content violates the messages.content CHECK -> Failed.
-    send_cmd(&mut ws, &send_message_cmd(rid, "", vec![])).await;
+    send_cmd(&mut ws, &send_message_cmd("general", "", vec![])).await;
     assert_eq!(next_reply(&mut ws).await, ServerEvent::Failed);
 
     // The session is still usable afterward.
-    send_cmd(&mut ws, &send_message_cmd(rid, "recovered", vec![])).await;
+    send_cmd(&mut ws, &send_message_cmd("general", "recovered", vec![])).await;
     assert!(matches!(
         next_reply(&mut ws).await,
         ServerEvent::MessageCreated { .. }
@@ -202,7 +201,7 @@ async fn malformed_attachment_rolls_back_the_message(pool: PgPool) {
     // size_bytes = 0 violates the message_attachments CHECK; the whole insert
     // (message included) must roll back.
     let bad = vec![attachment("empty.bin", 1, 0)];
-    send_cmd(&mut ws, &send_message_cmd(rid, "has a bad file", bad)).await;
+    send_cmd(&mut ws, &send_message_cmd("general", "has a bad file", bad)).await;
     assert_eq!(next_reply(&mut ws).await, ServerEvent::Failed);
 
     let msg_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE room_id = $1")

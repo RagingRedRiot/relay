@@ -17,7 +17,7 @@ pub enum ClientCommand {
     // more files whose bytes follow as binary chunk frames, each keyed by an
     // attachment_id the server hands back in MessageCreated.
     SendMessage {
-        room_id: Uuid,
+        room_name: String,
         content: String,
         #[serde(default)]
         attachments: Vec<NewMessageAttachment>,
@@ -158,6 +158,10 @@ pub enum ClientCommand {
     DeclineInvite {
         room_name: String,
     },
+    // Whether the server has open (unauthenticated) signups enabled. Valid in the
+    // prelude (before auth) so a client can decide whether to offer registration,
+    // and also after auth. Reply: SignupStatus.
+    GetSignupStatus,
     // Restart the entire server process: drain every connection and actor, then
     // re-initialize from a fresh config. Admin only. The issuing connection is torn
     // down with the rest, so the client should expect its socket to close shortly
@@ -174,7 +178,9 @@ pub enum ClientCommand {
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub enum ServerEvent {
-    AuthOk,
+    AuthOk {
+        is_admin: bool,
+    },
     NoAuth,
     Echo {
         string: String,
@@ -197,6 +203,10 @@ pub enum ServerEvent {
     // the frame header) the server will accept in one upload frame.
     MaxChunkSize {
         bytes: usize,
+    },
+    // Reply to GetSignupStatus: whether unauthenticated account creation is open.
+    SignupStatus {
+        open_signups: bool,
     },
     // One chunk of a download, streamed back in seq order. The sender task emits
     // this as a BINARY frame -- [attachment_id 16B][seq u32 BE 4B][payload] -- and

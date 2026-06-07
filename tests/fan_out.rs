@@ -31,11 +31,11 @@ async fn connect(server: &TestServer, username: &str, password: &str) -> Ws {
 
 // Post a message and return its id, skipping the poster's own live echo to read
 // the MessageCreated ack.
-async fn post(ws: &mut Ws, room_id: Uuid, content: &str) -> Uuid {
+async fn post(ws: &mut Ws, room_name: &str, content: &str) -> Uuid {
     send_cmd(
         ws,
         &ClientCommand::SendMessage {
-            room_id,
+            room_name: room_name.to_owned(),
             content: content.to_owned(),
             attachments: vec![],
         },
@@ -72,12 +72,11 @@ async fn member_receives_another_members_message_live(pool: PgPool) {
     seed_room(&pool, "vault", "alice", false, false).await;
     seed_membership(&pool, "vault", "bob").await;
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let room = room_id(&pool, "vault").await;
 
     let mut alice = connect(&server, "alice", "alicepw").await;
     let mut bob = connect(&server, "bob", "bobpw").await;
 
-    let message_id = post(&mut alice, room, "hello room").await;
+    let message_id = post(&mut alice, "vault", "hello room").await;
 
     let (room_name, message) = recv_new_message(&mut bob).await;
     assert_eq!(room_name, "vault");
@@ -91,14 +90,13 @@ async fn sender_receives_its_own_echo(pool: PgPool) {
     seed_user(&pool, "alice", "alicepw").await;
     seed_room(&pool, "vault", "alice", false, false).await;
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let room = room_id(&pool, "vault").await;
 
     let mut alice = connect(&server, "alice", "alicepw").await;
 
     send_cmd(
         &mut alice,
         &ClientCommand::SendMessage {
-            room_id: room,
+            room_name: "vault".to_owned(),
             content: "echo me".to_owned(),
             attachments: vec![],
         },
@@ -130,13 +128,12 @@ async fn non_member_receives_nothing(pool: PgPool) {
     seed_user(&pool, "carl", "carlpw").await;
     seed_room(&pool, "vault", "alice", false, false).await;
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let room = room_id(&pool, "vault").await;
 
     let mut alice = connect(&server, "alice", "alicepw").await;
     // carl is a valid, connected user but not a member of vault.
     let mut carl = connect(&server, "carl", "carlpw").await;
 
-    post(&mut alice, room, "members only").await;
+    post(&mut alice, "vault", "members only").await;
 
     // carl never subscribed to vault, so nothing is delivered to him.
     assert_no_event(&mut carl, Duration::from_millis(500)).await;
@@ -148,13 +145,12 @@ async fn joining_subscribes_to_live_messages(pool: PgPool) {
     seed_user(&pool, "bob", "bobpw").await;
     seed_room(&pool, "vault", "alice", true, false).await; // public so bob can join
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let room = room_id(&pool, "vault").await;
 
     let mut alice = connect(&server, "alice", "alicepw").await;
     let mut bob = connect(&server, "bob", "bobpw").await;
 
     // Before joining, bob isn't subscribed.
-    post(&mut alice, room, "before join").await;
+    post(&mut alice, "vault", "before join").await;
     assert_no_event(&mut bob, Duration::from_millis(300)).await;
 
     // Joining subscribes him: subscribe_room runs before the Success reply, so once
@@ -168,7 +164,7 @@ async fn joining_subscribes_to_live_messages(pool: PgPool) {
     .await;
     assert_eq!(next_reply(&mut bob).await, ServerEvent::Success);
 
-    let message_id = post(&mut alice, room, "after join").await;
+    let message_id = post(&mut alice, "vault", "after join").await;
     let (_, message) = recv_new_message(&mut bob).await;
     assert_eq!(message.message_id, message_id);
     assert_eq!(message.content, "after join");
@@ -181,7 +177,6 @@ async fn leaving_unsubscribes_from_live_messages(pool: PgPool) {
     seed_room(&pool, "vault", "alice", true, false).await;
     seed_membership(&pool, "vault", "bob").await;
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let room = room_id(&pool, "vault").await;
 
     let mut alice = connect(&server, "alice", "alicepw").await;
     let mut bob = connect(&server, "bob", "bobpw").await;
@@ -199,7 +194,7 @@ async fn leaving_unsubscribes_from_live_messages(pool: PgPool) {
     // the post; give it a moment to drain so the StreamMap entry is really gone.
     sleep(Duration::from_millis(200)).await;
 
-    post(&mut alice, room, "after bob left").await;
+    post(&mut alice, "vault", "after bob left").await;
     assert_no_event(&mut bob, Duration::from_millis(500)).await;
 }
 
@@ -210,7 +205,6 @@ async fn approval_subscribes_an_online_requester(pool: PgPool) {
     // Private but discoverable: bob can request to join, the owner approves.
     seed_room(&pool, "vault", "alice", false, true).await;
     let server = spawn_app(pool.clone(), |_| {}).await;
-    let room = room_id(&pool, "vault").await;
 
     let mut alice = connect(&server, "alice", "alicepw").await;
     let mut bob = connect(&server, "bob", "bobpw").await;
@@ -238,7 +232,7 @@ async fn approval_subscribes_an_online_requester(pool: PgPool) {
     assert_eq!(next_reply(&mut alice).await, ServerEvent::Success);
 
     // bob gets live messages without reconnecting.
-    let message_id = post(&mut alice, room, "welcome aboard").await;
+    let message_id = post(&mut alice, "vault", "welcome aboard").await;
     let (_, message) = recv_new_message(&mut bob).await;
     assert_eq!(message.message_id, message_id);
     assert_eq!(message.content, "welcome aboard");
