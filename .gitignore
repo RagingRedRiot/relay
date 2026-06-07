@@ -26,7 +26,10 @@ target
 .env
 
 # Personal notes, not for commit
-NOTES.txt
+NOTES.*
 
 # Local dev infrastructure, not for commit
 docker-compose.yml
+
+# Claude Code skills (local, not for commit)
+.claude/skills/

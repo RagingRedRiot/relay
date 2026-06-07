@@ -6,7 +6,7 @@ A self-hosted real-time chat platform written in async Rust.
 
 ## Overview
 
-Relay is a WebSocket chat server built on Axum, Tokio, and Postgres. Clients exchange a tagged JSON protocol over WebSocket; the server handles connection lifecycle, per-IP rate limiting, and graceful shutdown around it. Accounts, rooms, messages, attachments, reactions, and read state are persisted in Postgres; password verification uses Argon2id. Messages fan out to connected room members in real time.
+Relay is a WebSocket chat server built on Axum, Tokio, and Postgres. Clients exchange a tagged JSON protocol over WebSocket; the server handles connection lifecycle, per-IP rate limiting, and graceful shutdown around it. Accounts, rooms, messages, attachments, reactions, and read state are persisted in Postgres; password verification uses Argon2id. Messages fan out to connected room members in real time. The binary also serves a bundled default web client (a Svelte + TypeScript frontend embedded at compile time), so a deployment is usable out of the box without a separate client.
 
 > **Developer documentation** — for a full map of how the system is threaded together (actors, per-connection tasks, the fan-out hub, the request lifecycle) plus reference catalogs for the wire protocol, channels, and data model, see [`docs/`](docs/), starting with [`docs/architecture.md`](docs/architecture.md).
 
@@ -59,20 +59,23 @@ Deleting a user cascades to credentials, admin grant, and memberships but preser
 - DB-backed user accounts with Argon2id password verification
 - User CRUD: create (open-signup or admin-gated), look up, edit profile, delete, self password update, admin password reset
 - Admin model: bootstrap default admin, promote, demote, default-admin protection
-- Rooms: visibility (public/discoverable), multi-owner membership, rename, public join/leave, request-to-join with approve/reject, invite with accept/decline
+- Admin moderation: list every room (including private, non-discoverable), and read any room's message history regardless of membership
+- Rooms: visibility (public/discoverable), multi-owner membership, rename, public join/leave, request-to-join with approve/reject (and requester self-cancel), invite with accept/decline, owner/admin removal of a member (kick)
 - Messaging: send, paginated history (newest-first keyset), reactions
-- Attachments: resumable chunked upload/download with size + SHA-256 verification
-- Real-time fan-out: live message delivery to connected room members, with dynamic and cross-session subscription and a lossy-with-resync delivery model
+- Attachments: resumable chunked upload/download with size + SHA-256 verification, plus a server-side content-type policy (magic-byte sniff that corrects mislabeled types and rejects unsupported ones)
+- Real-time fan-out: live message delivery to connected room members, with dynamic and cross-session subscription (and live unsubscribe when a member is kicked), and a lossy-with-resync delivery model
 - Read state: per-room read watermark, mark-read, and unread counts
 - Time-based reaper: ages out old messages, empty rooms, stale invites/requests, and abandoned uploads
 - Admin server lifecycle: in-app restart and shutdown, via a supervisor loop that re-initializes a fresh server pass without dropping the listen port
+- Structured logging and tracing across the server (`tracing`), with a dedicated audit target for security-relevant events
+- Bundled default web client: a Svelte + TypeScript frontend embedded in the binary at compile time (`rust-embed`), overridable with `FRONTEND_DIR`
 - Integration tests against real Postgres via `sqlx::test`
 
 ## Roadmap
 
-- **Structured logging and tracing** — replace `println!` and the `// TODO - Logging` markers throughout the actors and session paths with structured events.
 - **TLS enforcement** — harden the release configuration so plain-text listeners can't be misconfigured.
-- **A first-party client** — the server ships only a minimal browser test page; a real client would exercise the [client contract](docs/client-contract.md) end to end.
+- **Admin moderation depth** — extend admin read-through (it covers message history today) to attachment downloads, and consider live subscription so admins can watch a room in real time, not just on reload.
+- **First-party client polish** — the bundled Svelte client now covers auth, rooms, messaging, attachments, reactions, admin tooling, and theming; remaining work is hardening it against the full [client contract](docs/client-contract.md) (notification, offline catch-up edge cases) and broadening test coverage.
 
 ## Running locally
 

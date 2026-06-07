@@ -91,9 +91,8 @@ pub async fn app(
     // override). Otherwise serve the embedded default frontend. Both paths fall
     // back to index.html for unmatched routes so client-side routing works.
     if let Some(dir) = frontend_dir {
-        router.fallback_service(
-            ServeDir::new(&dir).fallback(ServeFile::new(dir.join("index.html"))),
-        )
+        router
+            .fallback_service(ServeDir::new(&dir).fallback(ServeFile::new(dir.join("index.html"))))
     } else {
         router.fallback(embedded_asset)
     }

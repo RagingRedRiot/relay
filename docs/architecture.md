@@ -142,9 +142,12 @@ cancellation token, and a `ServerControl` (the sending half of the control chann
 so an admin command can drive the lifecycle — §9). Axum clones it into each `/ws`
 upgrade.
 
-Routes: `/` and `/script.js` (a minimal browser test client), `/health`,
-`/favicon.ico`, and `/ws` (the WebSocket upgrade). A per-IP rate-limit layer
-(`tower_governor`) wraps the router (§9).
+Routes: `/health`, `/favicon.ico`, `/ws` (the WebSocket upgrade), and a **fallback
+that serves the frontend** — the default Svelte client baked into the binary at
+compile time with `rust-embed` (`Assets` in `src/handler.rs`), or a directory on
+disk when `FRONTEND_DIR` is set (an operator override). Both fall back to
+`index.html` for unmatched paths so the client's own routing works. A per-IP
+rate-limit layer (`tower_governor`) wraps the router (§9).
 
 ---
 
@@ -235,14 +238,23 @@ sender task over `sub_tx`:
 
 - on connect → subscribe to all current rooms;
 - on `JoinRoom` / `AcceptInvite` success → subscribe (self);
-- on `LeaveRoom` success → unsubscribe.
+- on `LeaveRoom` success → unsubscribe (self).
 
-**Cross-session subscription.** When an owner *approves* someone else's join
-request, the new member isn't the caller — so the room actor reaches that user's
-sessions through the `sessions` presence map and pushes a subscribe to each
-(`hub.subscribe_user_to_room`). Sessions register on connect and deregister via a
-`SessionGuard` (RAII) when the task ends. Offline users simply have no entry and
-subscribe on their next connect.
+**Cross-session subscription changes.** Some membership changes are driven by
+*another* user, so the affected user isn't the caller. The room actor reaches that
+user's sessions through the `sessions` presence map and pushes the change to each:
+
+- **Approve a join request** → `hub.subscribe_user_to_room`: the admitted user's
+  open sessions start receiving the room's live events without reconnecting.
+- **Remove a member (kick)** → `hub.unsubscribe_user_from_room`: the removed user's
+  sessions drop that room's live stream immediately (a `Subscription::Remove` to
+  each), rather than continuing to receive messages until their next reconnect. The
+  JIT membership checks already block their reads/writes; this closes the live feed
+  too.
+
+Sessions register on connect and deregister via a `SessionGuard` (RAII) when the
+task ends. Offline users simply have no entry; they pick up the new state (as a
+member, or no longer one) on their next connect.
 
 > **Consequence for clients:** the socket is a *mixed stream*. Command replies and
 > pushed events (`NewMessage`, `Resync`) interleave, and a sender even receives the
@@ -266,15 +278,23 @@ bytes follow as **binary WebSocket frames**:
 (spawned on the first chunk, disposable). The actor persists chunks idempotently
 (`ON CONFLICT DO NOTHING` on `(attachment_id, seq)`), so a stalled upload *resumes*
 by re-sending only the missing seqs. When every chunk is present it streams them in
-order through a SHA-256 hasher, checks size + digest, then CAS-flips `is_complete`
-and emits `AttachmentComplete`. A bounded **write semaphore** caps concurrent chunk
-writes so an upload burst can't drain the pool. Idle uploads time out; the reaper
-sweeps abandoned partials.
+order through a SHA-256 hasher and checks size + digest. It then **sniffs the file's
+leading bytes against a content-type policy** (`resolve_content_type`): magic-detected
+binary types (images/PDF/ZIP) are stored as their *detected* type — correcting a
+mislabeled declaration, so the client can't lie — while magicless text types are
+honored only from a small allowlist (and rejected if the bytes look binary).
+Anything unsupported is rejected. On acceptance it CAS-flips `is_complete` (writing
+the corrected `content_type` in the same statement) and emits `AttachmentComplete`;
+on rejection it leaves the row incomplete and emits `AttachmentRejected { reason }`
+to the uploader. A bounded **write semaphore** caps concurrent chunk writes so an
+upload burst can't drain the pool. Idle uploads time out; the reaper sweeps
+abandoned partials. (Catalog of the policy: [`reference/wire-protocol.md`](reference/wire-protocol.md).)
 
 **Download.** `DownloadAttachment` spawns a disposable streaming task: a
-membership check, then chunks streamed back as binary frames (same framing) in seq
-order, ended by `AttachmentEnd`. A bounded **read semaphore** mirrors the write
-side.
+**membership** check (the room's members only — note this is stricter than history
+reads, which admins may also perform, §9), then chunks streamed back as binary
+frames (same framing) in seq order, ended by `AttachmentEnd`. A bounded **read
+semaphore** mirrors the write side.
 
 Full framing and event details: [`reference/wire-protocol.md`](reference/wire-protocol.md).
 
@@ -365,6 +385,14 @@ bound.
 re-checked at each privileged action, never cached on the session, so a revoked
 right takes effect on the next command. Client-facing errors are intentionally
 generic; detail belongs in server logs.
+
+**Admin moderation reads.** Admins can read any room for moderation, even ones
+they're not a member of: `GetMessages` resolves the room for a member *or* an admin
+(`resolve_readable_room`), and `GetRoom` / `GetRoomMembership` already treat admins
+as able to see private rooms. `ListAllRooms` (admin only) lists every room including
+private, non-discoverable ones that `ListDiscoverableRooms` hides. Writes stay
+member-gated: an admin reading a non-member room can't post, mark-read, or (today)
+download its attachments — reading the message stream is the moderation surface.
 
 ---
 

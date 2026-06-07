@@ -67,10 +67,14 @@ whitespace-trimmed: lookups use `LOWER(trim_ws($1))` against the unique
 `LOWER(...)` indexes (`trim_ws` is a custom immutable SQL function).
 
 **Attachment completeness.** `message_attachments.is_complete` flips true only after
-every chunk is present and the streamed SHA-256 + total size match the declaration
-(a monotonic `false → true` CAS). Incomplete rows are swept by the reaper after a
-~24h grace; the partial-index `message_attachments_incomplete (created_at) WHERE NOT
-is_complete` serves that sweep.
+every chunk is present, the streamed SHA-256 + total size match the declaration, and
+the bytes pass a **content-type policy** (a magic-byte sniff: the stored
+`content_type` is set to the *detected* type for recognized formats, or the file is
+rejected) — a monotonic `false → true` CAS that also writes the corrected
+`content_type`. So `content_type` is **server-verified**, not merely client-declared.
+Rejected and incomplete rows are swept by the reaper after a ~24h grace; the
+partial-index `message_attachments_incomplete (created_at) WHERE NOT is_complete`
+serves that sweep.
 
 ## Bootstrap & cleanup
 
