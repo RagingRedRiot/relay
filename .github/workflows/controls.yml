@@ -1,0 +1,97 @@
+name: Controls
+
+# A check a pull request cannot rewrite.
+#
+# Every job in ci.yml is defined by the copy of the file *in the pull request*,
+# so a PR can edit it: replace `cargo test` with `true`, or drop the
+# test-modification notice, and still go green. Required status checks match
+# by name, not by content, so that is enough.
+#
+# This workflow runs on `pull_request_target`, which uses the **base branch's**
+# copy of the file. A PR cannot change what runs here without first merging a
+# change to main, which this same check gates.
+#
+# It fails any PR that touches a control file unless someone with write access
+# has said they reviewed it by applying the `reviewed-controls` label. The label
+# only counts on the event that applies it: any later push (or any other label
+# change) fails the check again, so it must be removed and re-applied after
+# reading the new diff. A label left over from an earlier review never covers
+# code pushed after it.
+#
+# SAFETY: `pull_request_target` runs with the base repository's token, so this
+# job must never check out or execute the PR's code. It does neither: it asks
+# the API which files changed and compares names. Keep it that way.
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  control-files:
+    name: control files reviewed
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if a control file changed without the reviewed-controls label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          ACTION: ${{ github.event.action }}
+          APPLIED_LABEL: ${{ github.event.label.name }}
+        run: |
+          set -euo pipefail
+
+          # .github/ in any form: the workflows decide what "passing" means, and
+          # without this entry a PR could disable this job for every PR after it.
+          # tests/ only when existing code changes: a new test file is always
+          # welcome, but editing, deleting or renaming one can weaken what CI
+          # proves (the same rule as ci.yml's detect-test-modifications).
+          is_control() {
+            local status="$1" file="$2" previous="$3"
+            case "$file" in .github/*) return 0 ;; esac
+            case "$previous" in .github/*|tests/*) return 0 ;; esac
+            case "$file" in
+              tests/*) [ "$status" != added ] && return 0 ;;
+            esac
+            return 1
+          }
+
+          touched=()
+          while IFS=$'\t' read -r status file previous; do
+            [ -z "$file" ] && continue
+            if is_control "$status" "$file" "$previous"; then
+              touched+=("$status: ${previous:+$previous -> }$file")
+            fi
+          done < <(gh api "repos/$REPO/pulls/$PR/files" --paginate \
+            --jq '.[] | [.status, .filename, (.previous_filename // "")] | @tsv')
+
+          if [ ${#touched[@]} -eq 0 ]; then
+            echo "No control file touched."
+            exit 0
+          fi
+
+          echo "This pull request changes control files:"
+          printf '  %s\n' "${touched[@]}"
+
+          if [ "$ACTION" = labeled ] && [ "$APPLIED_LABEL" = reviewed-controls ]; then
+            echo
+            echo "reviewed-controls was just applied — allowed."
+            exit 0
+          fi
+
+          cat <<'EOF'
+
+          These files decide what CI checks and what "passing" means: the
+          workflows under .github/, and the existing tests under tests/.
+
+          Read the diff. If the change is intended, apply the `reviewed-controls`
+          label to this pull request and this check will pass. If the label is
+          already on, a push or label change since it was applied has reset
+          this check: remove it and apply it again after reading the new diff.
+          EOF
+          exit 1
