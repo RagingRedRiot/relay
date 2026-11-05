@@ -9,6 +9,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Read-only token by default. A job that needs more (detect-test-modifications
+# comments on the PR) declares its own block, which replaces this one.
+permissions:
+  contents: read
+
 jobs:
   fmt:
     name: cargo fmt --check

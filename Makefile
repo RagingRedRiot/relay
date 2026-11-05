@@ -37,8 +37,10 @@ db:
 # Populate the database with test users, rooms, and messages.
 # Runs migrations first, so this is also the first-time setup step.
 # Safe to re-run: existing data is left untouched.
+# Local databases only: refuses a non-loopback DATABASE_URL unless
+# RELAY_ALLOW_SEED=1 is set.
 #
-#   admin  / admin123  (admin)
+#   admin  / ADMIN_USERNAME + ADMIN_CREDENTIAL from .env  (admin)
 #   alice  / password
 #   bob    / password
 #   carol  / password
