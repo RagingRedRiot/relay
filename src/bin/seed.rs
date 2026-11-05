@@ -8,8 +8,12 @@
 //! only inserted when the messages table is empty, so a partial re-run won't
 //! duplicate them.
 //!
+//! Local databases only: seeding refuses to run unless `DATABASE_URL` points
+//! at a loopback host or a Unix socket. To seed a dev database elsewhere (a
+//! LAN box, another container), set `RELAY_ALLOW_SEED=1`.
+//!
 //! Credentials after seeding:
-//!   admin  / admin123   (admin)
+//!   admin  / ADMIN_USERNAME + ADMIN_CREDENTIAL from .env   (admin)
 //!   alice  / password
 //!   bob    / password
 //!   carol  / password
@@ -18,7 +22,9 @@ use relay::config::Config;
 use relay::model::{NewCredential, NewUser, Password};
 use relay::user::{UserResponse, ensure_admin, spawn as spawn_users};
 use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use std::net::IpAddr;
+use std::str::FromStr;
 use tokio_util::sync::CancellationToken;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -32,9 +38,16 @@ async fn main() -> Result<(), BoxError> {
     // so the seed must use the same values or the seeded password will be lost.
     let config = Config::from_env().map_err(|e| format!("config error: {e}"))?;
 
+    // Check the target before connecting: seeding resets the admin password and
+    // creates accounts with known passwords, so it must never reach a real
+    // deployment by accident.
+    let options = PgConnectOptions::from_str(&config.database_url)?;
+    let allow = std::env::var("RELAY_ALLOW_SEED").is_ok_and(|v| v == "1");
+    check_seed_target(&options, allow)?;
+
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect(&config.database_url)
+        .connect_with(options)
         .await?;
 
     println!("running migrations...");
@@ -51,6 +64,34 @@ async fn main() -> Result<(), BoxError> {
 
     println!("\ndone.");
     Ok(())
+}
+
+/// Allow seeding only a loopback host or a Unix socket, unless overridden.
+/// The host is read from the parsed options, so a `PGHOST` fallback counts too.
+fn check_seed_target(options: &PgConnectOptions, allow_any: bool) -> Result<(), String> {
+    if allow_any || is_local(options) {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to seed {}:{}: seed is for local dev/test databases only. \
+         Point DATABASE_URL at localhost, or set RELAY_ALLOW_SEED=1 if this \
+         really is a dev database.",
+        options.get_host(),
+        options.get_port()
+    ))
+}
+
+fn is_local(options: &PgConnectOptions) -> bool {
+    if options.get_socket().is_some() {
+        return true;
+    }
+    let host = options.get_host();
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 async fn create_users(pool: &PgPool, config: &Config) -> Result<(), BoxError> {
@@ -231,4 +272,53 @@ async fn create_messages(pool: &PgPool, admin: &str) -> Result<(), BoxError> {
 
     println!("  {n} messages inserted");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(url: &str, allow_any: bool) -> Result<(), String> {
+        check_seed_target(&PgConnectOptions::from_str(url).unwrap(), allow_any)
+    }
+
+    #[test]
+    fn allows_loopback_hosts() {
+        for url in [
+            "postgres://relay:relay@localhost:5432/relay",
+            "postgres://relay:relay@LOCALHOST/relay",
+            "postgres://relay:relay@127.0.0.1:5432/relay",
+            "postgres://relay:relay@127.0.0.53/relay",
+            "postgres://relay:relay@[::1]:5432/relay",
+        ] {
+            assert!(check(url, false).is_ok(), "{url} should be allowed");
+        }
+    }
+
+    #[test]
+    fn allows_unix_socket() {
+        let url = "postgres://relay@localhost/relay?host=/var/run/postgresql";
+        assert!(check(url, false).is_ok());
+        let url = "postgres:///relay?host=/var/run/postgresql";
+        assert!(check(url, false).is_ok());
+    }
+
+    #[test]
+    fn refuses_remote_hosts() {
+        for url in [
+            "postgres://relay:relay@db.example.com:5432/relay",
+            "postgres://relay:relay@10.0.0.5/relay",
+            "postgres://relay:relay@db/relay",
+            "postgres://relay:relay@[2001:db8::1]/relay",
+            "postgres://relay:relay@localhost.example.com/relay",
+        ] {
+            let err = check(url, false).expect_err(url);
+            assert!(err.contains("RELAY_ALLOW_SEED"), "{err}");
+        }
+    }
+
+    #[test]
+    fn override_allows_remote_hosts() {
+        assert!(check("postgres://relay:relay@db.example.com/relay", true).is_ok());
+    }
 }
